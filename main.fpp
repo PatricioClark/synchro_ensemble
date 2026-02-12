@@ -235,6 +235,10 @@
 ! Time evolution
          CALL forcemethod%update_GForce(pde,force) ! Update forcing?
          CALL pde%timestep(time, field, force, dt, field_nxt)
+    
+         CALL replace_scale(field_nxt, field2)
+         CALL pde2%timestep(time, field2, force, dt, field_nxt2)
+
          field = field_nxt
          timet = timet+1
          times = times+1
