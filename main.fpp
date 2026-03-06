@@ -43,32 +43,41 @@
       USE ic_factory
       USE force_factory
       USE equation_factory
+      USE stepper_factory
 !     USE class_GPart
 
       IMPLICIT NONE
 
 !
+! Type encapsulating all state for a single nudged simulation member
+      TYPE :: GNudgedSim
+          TYPE(GState),        ALLOCATABLE, TARGET :: field(:),field_nxt(:),force(:)
+          CLASS(EquationBase), ALLOCATABLE         :: pde
+          CLASS(GStepperBase), ALLOCATABLE         :: stepper
+          CLASS(icChain),      ALLOCATABLE         :: iclist(:)
+          CLASS(forceBase),    ALLOCATABLE         :: forcemethod
+          INTEGER                                  :: num_components
+      END TYPE GNudgedSim
+
+!
 ! Arrays for the field states, workspace, I/O, and PDE solver class
 
-      TYPE(GState), ALLOCATABLE, TARGET :: field(:),field_nxt(:),force(:)
-      TYPE(GWorkspace)                  :: workspace
-      TYPE(IOPLAN)                      :: planio
-      CLASS(EquationBase), ALLOCATABLE  :: pde
-      CLASS(icChain),      ALLOCATABLE  :: iclist(:)
-      CLASS(forceBase),    ALLOCATABLE  :: forcemethod
+      TYPE(GStateComp),    ALLOCATABLE :: field(:),field_nxt(:),force(:)
+      TYPE(GWorkspace)                 :: workspace
+      TYPE(IOPLAN)                     :: planio
+      CLASS(EquationBase), ALLOCATABLE :: pde
+      CLASS(GStepperBase), ALLOCATABLE :: stepper
+      CLASS(icChain),      ALLOCATABLE :: iclist(:)
+      CLASS(forceChain),   ALLOCATABLE :: forcemethod(:)
 
-      TYPE(GState), ALLOCATABLE, TARGET :: field2(:),field_nxt2(:),force2(:)
-      TYPE(GWorkspace)                  :: workspace2
-      CLASS(EquationBase), ALLOCATABLE  :: pde2
-      CLASS(icChain),      ALLOCATABLE  :: iclist2(:)
-      CLASS(forceBase),    ALLOCATABLE  :: forcemethod2
+      TYPE(GNudgedSim), ALLOCATABLE :: ensemble(:)
 
 !
 ! Auxiliary variables
 
       INTEGER :: idevice, iret, ncuda, ngcuda, ppn
       INTEGER :: num_components
-      INTEGER :: num_components2
+      INTEGER :: ii
       INTEGER :: t,timep,pstep,lgmult
       INTEGER :: ihcpu1,ihcpu2
       INTEGER :: ihomp1,ihomp2
@@ -97,7 +106,7 @@
 ! Initialization of time integration parameters
       CALL status_init('parameter.inp')
 
-! Initialization of I/O
+! I/O initialization
       CALL range(1,nx/2+1,nprocs,myrank,ista,iend)
       CALL range(1,nz,nprocs,myrank,ksta,kend)
       CALL io_init(myrank,(/nx,ny,nz/),ksta,kend,planio)
@@ -111,17 +120,19 @@
      CALL GState_alloc(field_nxt, num_components)
      CALL GState_alloc(force    , num_components)
      iclist       = init_ic_from_file(     'parameter.inp')
-     forcemethod  = init_forcing_from_file('parameter.inp')
+     forcemethod  = init_forcing_from_file('parameter.inp',workspace)
 
-     pde2         = init_pdes_from_file(   'parameter.inp')
-     CALL workspace2%initialize_pool(NUMTMPREAL,NUMTMPCOMP)
-     CALL pde2%Solver_ctor('parameter.inp',workspace2,planio)
-     num_components2 = pde2%state_size()
-     CALL GState_alloc(field2    , num_components)
-     CALL GState_alloc(field_nxt2, num_components)
-     CALL GState_alloc(force2    , num_components)
-     iclist2       = init_ic_from_file(     'parameter.inp')
-     forcemethod2  = init_forcing_from_file('parameter.inp')
+     ALLOCATE(ensemble(1))
+     DO ii = 1, SIZE(ensemble)
+       ensemble(ii)%pde         = init_pdes_from_file(   'parameter.inp')
+       CALL ensemble(ii)%pde%Solver_ctor('parameter.inp',workspace,planio)
+       ensemble(ii)%num_components = ensemble(ii)%pde%state_size()
+       CALL GState_alloc(ensemble(ii)%field    , ensemble(ii)%num_components)
+       CALL GState_alloc(ensemble(ii)%field_nxt, ensemble(ii)%num_components)
+       CALL GState_alloc(ensemble(ii)%force    , ensemble(ii)%num_components)
+       ensemble(ii)%iclist      = init_ic_from_file(     'parameter.inp')
+       ensemble(ii)%forcemethod = init_forcing_from_file('parameter.inp',workspace)
+     END DO
 
 ! Initialization of the numerical domain
      CALL box_init('parameter.inp')
@@ -157,34 +168,40 @@
          CALL GTStop(ihwtm2)
       ENDIF
 
-!
-! Sets the external forcing
-
-      CALL forcemethod%init_GForce(pde,force)
-
-! Initial state
+! Initial states
  IC : IF (stat.eq.0) THEN                 ! If stat=0 we start a new run
         ini  = 1
         sind = 0                          ! index for the spectrum
         tind = 0                          ! index for the binaries
-        pind = 0                          ! index for the particles
+!       pind = 0                          ! index for the particles
         timet = tstep
+        timep = pstep
         timec = cstep
         times = sstep
-        timep = pstep
+        timef = 0
       ELSE                    ! If stat.ne.0 a previous run is continued
         ini = int((stat-1)*tstep) + 1
         tind = int(stat)
         sind = int(real(ini,kind=GP)/real(sstep,kind=GP)+1)
-        pind = int((stat-1)*lgmult+1)
+!       pind = int((stat-1)*lgmult+1)
         timet = 0
         timep = 0
-        times = int(modulo(float(ini-1),float(sstep)))
         timec = int(modulo(float(ini-1),float(cstep)))
+        times = int(modulo(float(ini-1),float(sstep)))
+        timef = int(modulo(float(ini-1),float(fstep)))
       ENDIF IC
       CALL init_allstates(iclist,pde,field)
+      CALL init_forcing(forcemethod,pde,force)
 
-!
+      DO ii = 1, SIZE(ensemble)
+        CALL init_allstates(ensemble(ii)%iclist, ensemble(ii)%pde, ensemble(ii)%field)
+        CALL init_forcing(ensemble(ii)%forcemethod, ensemble(ii)%pde, ensemble(ii)%force)
+        ensemble(ii)%stepper = build_stepper_from_file('parameter.inp',workspace,ensemble(ii)%pde)
+      END DO
+
+! Sets up the time stepper
+      stepper = build_stepper_from_file('parameter.inp',workspace,pde)
+
 ! Time integration scheme starts here.
 ! If we are doing a benchmark, we measure
 ! cputime before starting.
@@ -233,17 +250,20 @@
          ENDIF
 
 ! Time evolution
-         CALL forcemethod%update_GForce(pde,force) ! Update forcing?
-         CALL pde%timestep(time, field, force, dt, field_nxt)
+         CALL update_forcing(forcemethod,pde,force)
+         CALL stepper%step(time, field, force, dt, field_nxt)
     
-         CALL replace_scale(field_nxt, field2)
-         CALL pde2%timestep(time, field2, force, dt, field_nxt2)
+         DO ii = 1, SIZE(ensemble)
+            CALL replace_scales(field_nxt, ensemble(ii)%field, kndg)
+            CALL ensemble(ii)%stepper%step(time, ensemble(ii)%field, ensemble(ii)%force, dt, ensemble(ii)%field_nxt)
+            ensemble(ii)%field = ensemble(ii)%field_nxt
+         END DO
 
          field = field_nxt
          timet = timet+1
-         times = times+1
-         timec = timec+1
          timep = timep+1
+         timec = timec+1
+         times = times+1
 
       END DO RK
 
@@ -319,5 +339,49 @@
       CALL MPI_FINALIZE(ierr)
       CALL fftp3d_destroy_plan(plancr)
       CALL fftp3d_destroy_plan(planrc)
-      
+
+      CONTAINS
+
+!=================================================================
+! SUBROUTINE: replace_scales
+!
+! Replaces the spectral modes of 'dst' with those of 'src' for
+! all wavenumber shells k <= kndg. Modes at shells k > kndg in
+! 'dst' are left unchanged. Both states must have the same number
+! of components and be defined on the same distributed grid.
+!
+! Parameters:
+!   src  : source field state (reference simulation)
+!   dst  : destination field state (nudged simulation member)
+!   kndg : cutoff wavenumber shell (integer)
+!=================================================================
+      SUBROUTINE replace_scales(src, dst, kndg)
+
+          USE fprecision
+          USE mpivars
+          USE grid
+          USE kes
+          USE boxsize
+          USE gstate_mod
+
+          TYPE(GStateComp), INTENT(IN)    :: src(:)
+          TYPE(GStateComp), INTENT(INOUT) :: dst(:)
+          INTEGER,          INTENT(IN)    :: kndg
+
+          INTEGER :: ic, i, j, k
+
+          DO ic = 1, SIZE(src)
+              DO i = ista, iend
+                  DO j = 1, ny
+                      DO k = 1, nz
+                          IF (int(sqrt(kk2(k,j,i))/Dkk+0.5_GP) .le. kndg) THEN
+                              dst(ic)%ccomp(k,j,i) = src(ic)%ccomp(k,j,i)
+                          ENDIF
+                      END DO
+                  END DO
+              END DO
+          END DO
+
+      END SUBROUTINE replace_scales
+
       END PROGRAM MAIN
