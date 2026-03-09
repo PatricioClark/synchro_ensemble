@@ -51,18 +51,18 @@
 !
 ! Type encapsulating all state for a single nudged simulation member
       TYPE :: GNudgedSim
-          TYPE(GState),        ALLOCATABLE, TARGET :: field(:),field_nxt(:),force(:)
+          TYPE(GStateComp),    ALLOCATABLE, TARGET :: field(:),field_nxt(:),force(:)
           CLASS(EquationBase), ALLOCATABLE         :: pde
           CLASS(GStepperBase), ALLOCATABLE         :: stepper
           CLASS(icChain),      ALLOCATABLE         :: iclist(:)
-          CLASS(forceBase),    ALLOCATABLE         :: forcemethod
+          CLASS(forceChain),   ALLOCATABLE         :: forcemethod
           INTEGER                                  :: num_components
       END TYPE GNudgedSim
 
 !
 ! Arrays for the field states, workspace, I/O, and PDE solver class
 
-      TYPE(GStateComp),    ALLOCATABLE :: field(:),field_nxt(:),force(:)
+      TYPE(GStateComp),    ALLOCATABLE :: field(:),field_nxt(:),force(:),diff(:)
       TYPE(GWorkspace)                 :: workspace
       TYPE(IOPLAN)                     :: planio
       CLASS(EquationBase), ALLOCATABLE :: pde
@@ -77,12 +77,15 @@
 
       INTEGER :: idevice, iret, ncuda, ngcuda, ppn
       INTEGER :: num_components
-      INTEGER :: ii
+      INTEGER :: num_realizations, kndg
+      INTEGER :: ir, ic
       INTEGER :: t,timep,pstep,lgmult
+      CHARACTER(LEN=8) :: outlabel
       INTEGER :: ihcpu1,ihcpu2
       INTEGER :: ihomp1,ihomp2
       INTEGER :: ihwtm1,ihwtm2
       LOGICAL :: bbenchexist
+      NAMELIST / ensembleparams / num_realizations, kndg
 
 !
 ! Initialization
@@ -106,6 +109,17 @@
 ! Initialization of time integration parameters
       CALL status_init('parameter.inp')
 
+! Read ensemble size from parameter file
+      num_realizations = 1
+      kndg      = 1
+      IF (myrank.eq.0) THEN
+         OPEN(1,file='parameter.inp',status='unknown',form='formatted')
+         READ(1,NML=ensembleparams)
+         CLOSE(1)
+      ENDIF
+      CALL MPI_BCAST(num_realizations,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+      CALL MPI_BCAST(kndg     ,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+
 ! I/O initialization
       CALL range(1,nx/2+1,nprocs,myrank,ista,iend)
       CALL range(1,nz,nprocs,myrank,ksta,kend)
@@ -119,19 +133,20 @@
      CALL GState_alloc(field    , num_components)
      CALL GState_alloc(field_nxt, num_components)
      CALL GState_alloc(force    , num_components)
+     CALL GState_alloc(diff     , num_components)
      iclist       = init_ic_from_file(     'parameter.inp')
      forcemethod  = init_forcing_from_file('parameter.inp',workspace)
 
-     ALLOCATE(ensemble(1))
-     DO ii = 1, SIZE(ensemble)
-       ensemble(ii)%pde         = init_pdes_from_file(   'parameter.inp')
-       CALL ensemble(ii)%pde%Solver_ctor('parameter.inp',workspace,planio)
-       ensemble(ii)%num_components = ensemble(ii)%pde%state_size()
-       CALL GState_alloc(ensemble(ii)%field    , ensemble(ii)%num_components)
-       CALL GState_alloc(ensemble(ii)%field_nxt, ensemble(ii)%num_components)
-       CALL GState_alloc(ensemble(ii)%force    , ensemble(ii)%num_components)
-       ensemble(ii)%iclist      = init_ic_from_file(     'parameter.inp')
-       ensemble(ii)%forcemethod = init_forcing_from_file('parameter.inp',workspace)
+     ALLOCATE(ensemble(num_realizations))
+     DO ir = 1, SIZE(ensemble)
+       ensemble(ir)%pde         = init_pdes_from_file(   'parameter.inp')
+       CALL ensemble(ir)%pde%Solver_ctor('parameter.inp',workspace,planio)
+       ensemble(ir)%num_components = ensemble(ir)%pde%state_size()
+       CALL GState_alloc(ensemble(ir)%field    , ensemble(ir)%num_components)
+       CALL GState_alloc(ensemble(ir)%field_nxt, ensemble(ir)%num_components)
+       CALL GState_alloc(ensemble(ir)%force    , ensemble(ir)%num_components)
+       ensemble(ir)%iclist      = init_ic_from_file(     'parameter.inp')
+       ensemble(ir)%forcemethod = init_forcing_from_file('parameter.inp',workspace)
      END DO
 
 ! Initialization of the numerical domain
@@ -193,10 +208,10 @@
       CALL init_allstates(iclist,pde,field)
       CALL init_forcing(forcemethod,pde,force)
 
-      DO ii = 1, SIZE(ensemble)
-        CALL init_allstates(ensemble(ii)%iclist, ensemble(ii)%pde, ensemble(ii)%field)
-        CALL init_forcing(ensemble(ii)%forcemethod, ensemble(ii)%pde, ensemble(ii)%force)
-        ensemble(ii)%stepper = build_stepper_from_file('parameter.inp',workspace,ensemble(ii)%pde)
+      DO ir = 1, SIZE(ensemble)
+        CALL init_allstates(ensemble(ir)%iclist, ensemble(ir)%pde, ensemble(ir)%field)
+        CALL init_forcing(ensemble(ir)%forcemethod, ensemble(ir)%pde, ensemble(ir)%force)
+        ensemble(ir)%stepper = build_stepper_from_file('parameter.inp',workspace,ensemble(ir)%pde)
       END DO
 
 ! Sets up the time stepper
@@ -238,7 +253,16 @@
 
          IF ((timec.eq.cstep).and.(bench.eq.0)) THEN
             timec = 0
-	    CALL pde%global(field, force, t)
+            CALL hdcheck_ndg(field, force, t, dt, 1, 0, '_ref')
+            DO ir = 1, SIZE(ensemble)
+               WRITE(outlabel,'(A,I3.3,A)') '_ens', ir
+               CALL hdcheck_ndg(ensemble(ir)%field, ensemble(ir)%force, t, dt, 1, 0, outlabel)
+               DO ic = 1, num_components
+                  diff(ic)%ccomp = ensemble(ir)%field(ic)%ccomp - field(ic)%ccomp
+               END DO
+               WRITE(outlabel,'(A,I3.3,A)') '_dif', ir
+               CALL hdcheck_ndg(diff, force, t, dt, 1, 0, outlabel)
+            END DO
          ENDIF
 
 ! Every 'sstep' steps writes spectra
@@ -247,16 +271,30 @@
             times = 0
             sind = sind+1
             CALL pde%spectra(field)
+            DO ir = 1, SIZE(ensemble)
+               CALL ensemble(ir)%pde%spectra(ensemble(ir)%field)
+               DO ic = 1, num_components
+                  diff(ic)%ccomp = ensemble(ir)%field(ic)%ccomp - field(ic)%ccomp
+               END DO
+               CALL pde%spectra(diff)
+            END DO
          ENDIF
 
 ! Time evolution
          CALL update_forcing(forcemethod,pde,force)
          CALL stepper%step(time, field, force, dt, field_nxt)
     
-         DO ii = 1, SIZE(ensemble)
-            CALL replace_scales(field_nxt, ensemble(ii)%field, kndg)
-            CALL ensemble(ii)%stepper%step(time, ensemble(ii)%field, ensemble(ii)%force, dt, ensemble(ii)%field_nxt)
-            ensemble(ii)%field = ensemble(ii)%field_nxt
+         DO ir = 1, SIZE(ensemble)
+            CALL replace_scales(field_nxt, ensemble(ir)%field, kndg)
+             CALL update_forcing(ensemble(ir)%forcemethod, &
+                                 ensemble(ir)%pde, &
+                                 ensemble(ir)%force)
+            CALL ensemble(ir)%stepper%step(time, &
+                                           ensemble(ir)%field, &
+                                           ensemble(ir)%force, &
+                                           dt, &
+                                           ensemble(ir)%field_nxt)
+            ensemble(ir)%field = ensemble(ir)%field_nxt
          END DO
 
          field = field_nxt
@@ -341,6 +379,133 @@
       CALL fftp3d_destroy_plan(planrc)
 
       CONTAINS
+
+!=================================================================
+! SUBROUTINE: hdcheck_ndg
+!
+! Consistency check for the conservation of energy,
+! helicity, and null divergence of the velocity field.
+! Adapted from hdcheck in pseudospec3D_hd.f90 to take
+! GStateComp field arrays and a filename label, for use
+! with ensemble members and difference fields.
+!
+! Output files contain:
+! '<label>balance.txt':    time, <v^2>, <omega^2>, injection rate
+! '<label>helicity.txt':   time, kinetic helicity
+! '<label>divergence.txt': time, <(div.v)^2>   [if chk=1]
+!
+! Parameters:
+!   vel  : velocity field (3 components)
+!   frc  : forcing field  (3 components)
+!   t    : number of time steps made
+!   dt   : time step
+!   hel  : =0 skips helicity; =1 computes kinetic helicity
+!   chk  : =0 skips divergence check; =1 performs it
+!   label: prefix string for output filenames
+!=================================================================
+      SUBROUTINE hdcheck_ndg(vel, frc, t, dt, hel, chk, label)
+
+          USE fprecision
+          USE commtypes
+          USE grid
+          USE mpivars
+          USE gstate_mod
+!$        USE threads
+
+          IMPLICIT NONE
+
+          TYPE(GStateComp), INTENT(IN) :: vel(:), frc(:)
+          REAL(KIND=GP),    INTENT(IN) :: dt
+          INTEGER,          INTENT(IN) :: t, hel, chk
+          CHARACTER(LEN=*), INTENT(IN) :: label
+
+          COMPLEX(KIND=GP), DIMENSION(nz,ny,ista:iend) :: c1,c2,c3
+          DOUBLE PRECISION :: eng,ens,pot,khe
+          DOUBLE PRECISION :: div,tmp
+          REAL(KIND=GP)    :: tmq
+          INTEGER          :: i,j,k
+
+          div = 0.0D0
+          tmp = 0.0D0
+          tmq = 1.0_GP/ &
+                (real(nx,kind=GP)*real(ny,kind=GP)*real(nz,kind=GP))**2
+
+!
+! Computes the mean square value of the divergence
+!
+          IF (chk.eq.1) THEN
+
+          CALL derivk3(vel(1)%ccomp,c1,1)
+          CALL derivk3(vel(2)%ccomp,c2,2)
+          CALL derivk3(vel(3)%ccomp,c3,3)
+          IF (ista.eq.1) THEN
+!$omp parallel do private (k) reduction(+:tmp)
+             DO j = 1,ny
+                DO k = 1,nz
+                   tmp = tmp+abs(c1(k,j,1)+c2(k,j,1)+c3(k,j,1))**2*tmq
+                END DO
+             END DO
+!$omp parallel do if (iend-2.ge.nth) private (j,k) reduction(+:tmp)
+             DO i = 2,iend
+!$omp parallel do if (iend-2.lt.nth) private (k) reduction(+:tmp)
+                DO j = 1,ny
+                   DO k = 1,nz
+                      tmp = tmp+2*abs(c1(k,j,i)+c2(k,j,i)+c3(k,j,i))**2*tmq
+                   END DO
+                END DO
+             END DO
+          ELSE
+!$omp parallel do if (iend-ista.ge.nth) private (j,k) reduction(+:tmp)
+             DO i = ista,iend
+!$omp parallel do if (iend-ista.lt.nth) private (k) reduction(+:tmp)
+                DO j = 1,ny
+                   DO k = 1,nz
+                      tmp = tmp+2*abs(c1(k,j,i)+c2(k,j,i)+c3(k,j,i))**2*tmq
+                   END DO
+                END DO
+             END DO
+          ENDIF
+          CALL MPI_REDUCE(tmp,div,1,MPI_DOUBLE_PRECISION,MPI_SUM,0, &
+                          MPI_COMM_WORLD,ierr)
+
+          ENDIF
+
+!
+! Computes mean energy, enstrophy, and kinetic helicity
+!
+          CALL energy(vel(1)%ccomp,vel(2)%ccomp,vel(3)%ccomp,eng,1)
+          CALL energy(vel(1)%ccomp,vel(2)%ccomp,vel(3)%ccomp,ens,0)
+          IF (hel.eq.1) THEN
+             CALL helicity(vel(1)%ccomp,vel(2)%ccomp,vel(3)%ccomp,khe)
+          ENDIF
+
+!
+! Computes the energy injection rate
+!
+          CALL cross(vel(1)%ccomp,vel(2)%ccomp,vel(3)%ccomp, &
+                     frc(1)%ccomp,frc(2)%ccomp,frc(3)%ccomp,pot,1)
+
+!
+! Writes results to labelled output files
+!
+          IF (myrank.eq.0) THEN
+             OPEN(1,file='balance'//TRIM(label)//'.txt',position='append')
+             WRITE(1,10) (t-1)*dt,eng,ens,pot
+   10        FORMAT( E13.6,E26.18,E26.18,E26.18 )
+             CLOSE(1)
+             IF (hel.eq.1) THEN
+                OPEN(1,file='helicity'//TRIM(label)//'.txt',position='append')
+                WRITE(1,FMT='(E13.6,E26.18)') (t-1)*dt,khe
+                CLOSE(1)
+             ENDIF
+             IF (chk.eq.1) THEN
+                OPEN(1,file='divergence'//TRIM(label)//'.txt',position='append')
+                WRITE(1,FMT='(E13.6,E26.18)') (t-1)*dt,div
+                CLOSE(1)
+             ENDIF
+          ENDIF
+
+      END SUBROUTINE hdcheck_ndg
 
 !=================================================================
 ! SUBROUTINE: replace_scales
