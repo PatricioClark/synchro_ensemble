@@ -51,12 +51,12 @@
 !
 ! Type encapsulating all state for a single nudged simulation member
       TYPE :: GNudgedSim
-          TYPE(GStateComp),    ALLOCATABLE, TARGET :: field(:),field_nxt(:),force(:)
-          CLASS(EquationBase), ALLOCATABLE         :: pde
-          CLASS(GStepperBase), ALLOCATABLE         :: stepper
-          CLASS(icChain),      ALLOCATABLE         :: iclist(:)
-          CLASS(forceChain),   ALLOCATABLE         :: forcemethod
-          INTEGER                                  :: num_components
+          TYPE(GStateComp),    ALLOCATABLE :: field(:),field_nxt(:),force(:)
+          CLASS(EquationBase), ALLOCATABLE :: pde
+          CLASS(GStepperBase), ALLOCATABLE :: stepper
+          CLASS(icChain),      ALLOCATABLE :: iclist(:)
+          CLASS(forceChain),   ALLOCATABLE :: forcemethod(:)
+          INTEGER                          :: num_components
       END TYPE GNudgedSim
 
 !
@@ -78,7 +78,7 @@
       INTEGER :: idevice, iret, ncuda, ngcuda, ppn
       INTEGER :: num_components
       INTEGER :: num_realizations, kndg
-      INTEGER :: ir, ic
+      INTEGER :: ir, ip
       INTEGER :: t,timep,pstep,lgmult
       CHARACTER(LEN=8) :: outlabel
       INTEGER :: ihcpu1,ihcpu2
@@ -139,14 +139,27 @@
 
      ALLOCATE(ensemble(num_realizations))
      DO ir = 1, SIZE(ensemble)
-       ensemble(ir)%pde         = init_pdes_from_file(   'parameter.inp')
+       ! BLOCK and MOVE_ALLOC are needed becauce the base class
+       ! does not initilize the pointers to null ("=> null()" in declaration)
+       ! This is a workaround
+       BLOCK
+         CLASS(EquationBase), ALLOCATABLE :: tmp_pde
+         tmp_pde = init_pdes_from_file('parameter.inp')
+         CALL MOVE_ALLOC(tmp_pde, ensemble(ir)%pde)
+       END BLOCK
        CALL ensemble(ir)%pde%Solver_ctor('parameter.inp',workspace,planio)
        ensemble(ir)%num_components = ensemble(ir)%pde%state_size()
        CALL GState_alloc(ensemble(ir)%field    , ensemble(ir)%num_components)
        CALL GState_alloc(ensemble(ir)%field_nxt, ensemble(ir)%num_components)
        CALL GState_alloc(ensemble(ir)%force    , ensemble(ir)%num_components)
-       ensemble(ir)%iclist      = init_ic_from_file(     'parameter.inp')
-       ensemble(ir)%forcemethod = init_forcing_from_file('parameter.inp',workspace)
+       BLOCK
+         CLASS(icChain),    ALLOCATABLE :: tmp_ic(:)
+         CLASS(forceChain), ALLOCATABLE :: tmp_frc(:)
+         tmp_ic  = init_ic_from_file(     'parameter.inp')
+         tmp_frc = init_forcing_from_file('parameter.inp',workspace)
+         CALL MOVE_ALLOC(tmp_ic,  ensemble(ir)%iclist)
+         CALL MOVE_ALLOC(tmp_frc, ensemble(ir)%forcemethod)
+       END BLOCK
      END DO
 
 ! Initialization of the numerical domain
@@ -211,7 +224,11 @@
       DO ir = 1, SIZE(ensemble)
         CALL init_allstates(ensemble(ir)%iclist, ensemble(ir)%pde, ensemble(ir)%field)
         CALL init_forcing(ensemble(ir)%forcemethod, ensemble(ir)%pde, ensemble(ir)%force)
-        ensemble(ir)%stepper = build_stepper_from_file('parameter.inp',workspace,ensemble(ir)%pde)
+        BLOCK
+          CLASS(GStepperBase), ALLOCATABLE :: tmp_stp
+          tmp_stp = build_stepper_from_file('parameter.inp',workspace,ensemble(ir)%pde)
+          CALL MOVE_ALLOC(tmp_stp, ensemble(ir)%stepper)
+        END BLOCK
       END DO
 
 ! Sets up the time stepper
@@ -257,8 +274,8 @@
             DO ir = 1, SIZE(ensemble)
                WRITE(outlabel,'(A,I3.3,A)') '_ens', ir
                CALL hdcheck_ndg(ensemble(ir)%field, ensemble(ir)%force, t, dt, 1, 0, outlabel)
-               DO ic = 1, num_components
-                  diff(ic)%ccomp = ensemble(ir)%field(ic)%ccomp - field(ic)%ccomp
+               DO ip = 1, num_components
+                  diff(ip)%ccomp = ensemble(ir)%field(ip)%ccomp - field(ip)%ccomp
                END DO
                WRITE(outlabel,'(A,I3.3,A)') '_dif', ir
                CALL hdcheck_ndg(diff, force, t, dt, 1, 0, outlabel)
@@ -273,8 +290,8 @@
             CALL pde%spectra(field)
             DO ir = 1, SIZE(ensemble)
                CALL ensemble(ir)%pde%spectra(ensemble(ir)%field)
-               DO ic = 1, num_components
-                  diff(ic)%ccomp = ensemble(ir)%field(ic)%ccomp - field(ic)%ccomp
+               DO ip = 1, num_components
+                  diff(ip)%ccomp = ensemble(ir)%field(ip)%ccomp - field(ip)%ccomp
                END DO
                CALL pde%spectra(diff)
             END DO
@@ -410,6 +427,7 @@
           USE grid
           USE mpivars
           USE gstate_mod
+          USE pseudospec_fluid
 !$        USE threads
 
           IMPLICIT NONE
