@@ -80,7 +80,8 @@
       INTEGER :: num_realizations, kndg
       INTEGER :: ir, ip
       INTEGER :: t,timep,pstep,lgmult
-      CHARACTER(LEN=8) :: outlabel
+      CHARACTER(LEN=8)   :: outlabel
+      CHARACTER(LEN=128) :: odir_save
       INTEGER :: ihcpu1,ihcpu2
       INTEGER :: ihomp1,ihomp2
       INTEGER :: ihwtm1,ihwtm2
@@ -263,8 +264,21 @@
          IF ((timet.eq.tstep).and.(bench.eq.0)) THEN
             timet = 0
             tind = tind+1
-	    CALL pde%write_states(field, planio)
-	 ENDIF
+            CALL pde%write_states(field, planio)
+            DO ir = 1, SIZE(ensemble)
+               odir_save = odir
+               WRITE(outlabel,'(A,I3.3)') '_ens', ir
+               odir = TRIM(odir_save)//TRIM(outlabel)
+               CALL ensemble(ir)%pde%write_states(ensemble(ir)%field, planio)
+               DO ip = 1, num_components
+                  diff(ip)%ccomp = ensemble(ir)%field(ip)%ccomp - field(ip)%ccomp
+               END DO
+               WRITE(outlabel,'(A,I3.3)') '_dif', ir
+               odir = TRIM(odir_save)//TRIM(outlabel)
+               CALL pde%write_states(diff, planio)
+               odir = odir_save
+            END DO
+         ENDIF
 
 ! Every 'cstep' steps writes global quantities
 
