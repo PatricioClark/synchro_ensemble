@@ -287,13 +287,14 @@
          IF ((times.eq.sstep).and.(bench.eq.0)) THEN
             times = 0
             sind = sind+1
-            CALL pde%spectra(field)
+            WRITE(ext, fmtext) sind
+            CALL hdspectrum_ndg(field, '_ref')
             DO ir = 1, SIZE(ensemble)
-               CALL ensemble(ir)%pde%spectra(ensemble(ir)%field)
                DO ip = 1, num_components
                   diff(ip)%ccomp = ensemble(ir)%field(ip)%ccomp - field(ip)%ccomp
                END DO
-               CALL pde%spectra(diff)
+               WRITE(outlabel,'(A,I3.3)') '_dif', ir
+               CALL hdspectrum_ndg(diff, outlabel)
             END DO
          ENDIF
 
@@ -524,6 +525,35 @@
           ENDIF
 
       END SUBROUTINE hdcheck_ndg
+
+!=================================================================
+! SUBROUTINE: hdspectrum_ndg
+!
+! Computes and writes the kinetic energy spectrum for a field
+! given as a GStateComp array, appending a label to the filename.
+! Output file: 'kspectrum.<ext><label>.txt'
+!
+! Parameters:
+!   vel  : velocity field (3 components)
+!   label: suffix appended to the spectrum index in the filename
+!=================================================================
+      SUBROUTINE hdspectrum_ndg(vel, label)
+
+          USE fprecision
+          USE mpivars
+          USE gstate_mod
+          USE filefmt
+          USE pseudospec_fluid
+
+          IMPLICIT NONE
+
+          TYPE(GStateComp), INTENT(IN) :: vel(:)
+          CHARACTER(LEN=*), INTENT(IN) :: label
+
+          CALL spectrum(vel(1)%ccomp, vel(2)%ccomp, vel(3)%ccomp, &
+                        TRIM(ext)//TRIM(label), 1, 1)
+
+      END SUBROUTINE hdspectrum_ndg
 
 !=================================================================
 ! SUBROUTINE: replace_scales
