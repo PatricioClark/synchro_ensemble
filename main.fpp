@@ -304,6 +304,8 @@
             WRITE(ext, fmtext) sind
             CALL hdspectrum_ndg(field, '_ref')
             DO ir = 1, SIZE(ensemble)
+               WRITE(outlabel,'(A,I3.3)') '_ens', ir
+               CALL hdspectrum_ndg(ensemble(ir)%field, outlabel)
                DO ip = 1, num_components
                   diff(ip)%ccomp = ensemble(ir)%field(ip)%ccomp - field(ip)%ccomp
                END DO
