@@ -51,11 +51,10 @@
 !
 ! Type encapsulating all state for a single nudged simulation member
       TYPE :: GNudgedSim
-          TYPE(GStateComp),    ALLOCATABLE :: field(:),field_nxt(:),force(:)
+          TYPE(GStateComp),    ALLOCATABLE :: field(:),field_nxt(:)
           CLASS(EquationBase), ALLOCATABLE :: pde
           CLASS(GStepperBase), ALLOCATABLE :: stepper
           CLASS(icChain),      ALLOCATABLE :: iclist(:)
-          CLASS(forceChain),   ALLOCATABLE :: forcemethod(:)
           INTEGER                          :: num_components
       END TYPE GNudgedSim
 
@@ -152,16 +151,23 @@
        ensemble(ir)%num_components = ensemble(ir)%pde%state_size()
        CALL GState_alloc(ensemble(ir)%field    , ensemble(ir)%num_components)
        CALL GState_alloc(ensemble(ir)%field_nxt, ensemble(ir)%num_components)
-       CALL GState_alloc(ensemble(ir)%force    , ensemble(ir)%num_components)
        BLOCK
          CLASS(icChain),    ALLOCATABLE :: tmp_ic(:)
-         CLASS(forceChain), ALLOCATABLE :: tmp_frc(:)
          tmp_ic  = init_ic_from_file(     'parameter.inp')
-         tmp_frc = init_forcing_from_file('parameter.inp',workspace)
          CALL MOVE_ALLOC(tmp_ic,  ensemble(ir)%iclist)
-         CALL MOVE_ALLOC(tmp_frc, ensemble(ir)%forcemethod)
        END BLOCK
      END DO
+
+! Create ensemble output directories (odir_ensNNN, odir_difNNN)
+     IF (myrank.eq.0) THEN
+        DO ir = 1, SIZE(ensemble)
+           WRITE(outlabel,'(A,I3.3)') '_ens', ir
+           CALL EXECUTE_COMMAND_LINE('mkdir -p '//TRIM(odir)//TRIM(outlabel))
+           WRITE(outlabel,'(A,I3.3)') '_dif', ir
+           CALL EXECUTE_COMMAND_LINE('mkdir -p '//TRIM(odir)//TRIM(outlabel))
+        END DO
+     END IF
+     CALL MPI_BARRIER(MPI_COMM_WORLD,ierr)
 
 ! Initialization of the numerical domain
      CALL box_init('parameter.inp')
@@ -224,13 +230,17 @@
 
       DO ir = 1, SIZE(ensemble)
         CALL init_allstates(ensemble(ir)%iclist, ensemble(ir)%pde, ensemble(ir)%field)
-        CALL init_forcing(ensemble(ir)%forcemethod, ensemble(ir)%pde, ensemble(ir)%force)
         BLOCK
           CLASS(GStepperBase), ALLOCATABLE :: tmp_stp
           tmp_stp = build_stepper_from_file('parameter.inp',workspace,ensemble(ir)%pde)
           CALL MOVE_ALLOC(tmp_stp, ensemble(ir)%stepper)
         END BLOCK
       END DO
+
+! Initial replace scales
+     DO ir = 1, SIZE(ensemble)
+        CALL replace_scales(field, ensemble(ir)%field, kndg)
+     END DO
 
 ! Sets up the time stepper
       stepper = build_stepper_from_file('parameter.inp',workspace,pde)
@@ -287,7 +297,7 @@
             CALL hdcheck_ndg(field, force, t, dt, 1, 0, '_ref')
             DO ir = 1, SIZE(ensemble)
                WRITE(outlabel,'(A,I3.3,A)') '_ens', ir
-               CALL hdcheck_ndg(ensemble(ir)%field, ensemble(ir)%force, t, dt, 1, 0, outlabel)
+               CALL hdcheck_ndg(ensemble(ir)%field, force, t, dt, 1, 0, outlabel)
                DO ip = 1, num_components
                   diff(ip)%ccomp = ensemble(ir)%field(ip)%ccomp - field(ip)%ccomp
                END DO
@@ -320,12 +330,9 @@
     
          DO ir = 1, SIZE(ensemble)
             CALL replace_scales(field_nxt, ensemble(ir)%field, kndg)
-             CALL update_forcing(ensemble(ir)%forcemethod, &
-                                 ensemble(ir)%pde, &
-                                 ensemble(ir)%force)
             CALL ensemble(ir)%stepper%step(time, &
                                            ensemble(ir)%field, &
-                                           ensemble(ir)%force, &
+                                           force, &
                                            dt, &
                                            ensemble(ir)%field_nxt)
             ensemble(ir)%field = ensemble(ir)%field_nxt
