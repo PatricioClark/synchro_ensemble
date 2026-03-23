@@ -134,7 +134,8 @@
      CALL GState_alloc(field_nxt, num_components)
      CALL GState_alloc(force    , num_components)
      CALL GState_alloc(diff     , num_components)
-     iclist       = init_ic_from_file(     'parameter.inp')
+     ALLOCATE(icChain :: iclist(1))
+     ALLOCATE(read_v  :: iclist(1)%ic)
      forcemethod  = init_forcing_from_file('parameter.inp',workspace)
 
      ALLOCATE(ensemble(num_realizations))
@@ -294,15 +295,15 @@
 
          IF ((timec.eq.cstep).and.(bench.eq.0)) THEN
             timec = 0
-            CALL hdcheck_ndg(field, force, t, dt, 1, 0, '_ref')
+            CALL hdcheck_ndg(field, force, t, dt, 0, 0, '_ref')
             DO ir = 1, SIZE(ensemble)
                WRITE(outlabel,'(A,I3.3,A)') '_ens', ir
-               CALL hdcheck_ndg(ensemble(ir)%field, force, t, dt, 1, 0, outlabel)
+               CALL hdcheck_ndg(ensemble(ir)%field, force, t, dt, 0, 0, outlabel)
                DO ip = 1, num_components
                   diff(ip)%ccomp = ensemble(ir)%field(ip)%ccomp - field(ip)%ccomp
                END DO
                WRITE(outlabel,'(A,I3.3,A)') '_dif', ir
-               CALL hdcheck_ndg(diff, force, t, dt, 1, 0, outlabel)
+               CALL hdcheck_ndg(diff, force, t, dt, 0, 0, outlabel)
             END DO
          ENDIF
 
@@ -591,7 +592,7 @@
 !   dst  : destination field state (nudged simulation member)
 !   kndg : cutoff wavenumber shell (integer)
 !=================================================================
-      SUBROUTINE replace_scales(src, dst, kndg)
+      SUBROUTINE replace_scales(src, dst, kcut)
 
           USE fprecision
           USE mpivars
@@ -602,7 +603,7 @@
 
           TYPE(GStateComp), INTENT(IN)    :: src(:)
           TYPE(GStateComp), INTENT(INOUT) :: dst(:)
-          INTEGER,          INTENT(IN)    :: kndg
+          INTEGER,          INTENT(IN)    :: kcut
 
           INTEGER :: ic, i, j, k
 
@@ -610,7 +611,7 @@
               DO i = ista, iend
                   DO j = 1, ny
                       DO k = 1, nz
-                          IF (int(sqrt(kk2(k,j,i))/Dkk+0.5_GP) .le. kndg) THEN
+                          IF (int(sqrt(kk2(k,j,i))/Dkk+0.5_GP) .le. kcut) THEN
                               dst(ic)%ccomp(k,j,i) = src(ic)%ccomp(k,j,i)
                           ENDIF
                       END DO
