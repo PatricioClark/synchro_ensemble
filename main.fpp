@@ -330,12 +330,18 @@
          CALL stepper%step(time, field, force, dt, field_nxt)
     
          DO ir = 1, SIZE(ensemble)
-            CALL replace_scales(field_nxt, ensemble(ir)%field, kndg)
             CALL ensemble(ir)%stepper%step(time, &
                                            ensemble(ir)%field, &
                                            force, &
                                            dt, &
                                            ensemble(ir)%field_nxt)
+
+            ! Replace scales from reference into ensembles:
+            ! as there's an initial replace_scales before
+            ! the time stepping loop begins I do this here
+            ! in order to ensure the output always has the right
+            ! information in the large scales, otherwise there's some leakage
+            CALL replace_scales(field_nxt, ensemble(ir)%field_nxt, kndg)
             ensemble(ir)%field = ensemble(ir)%field_nxt
          END DO
 
