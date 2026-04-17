@@ -7,7 +7,7 @@
 ! in 2 and 3 dimensions with periodic boundary conditions
 ! and external forcing. A pseudo-spectral method is used to
 ! compute spatial derivatives, while different time steppings
-! can be usedd to evolve the system in the time domain.
+! can be used to evolve the system in the time domain.
 !
 ! Notation: index 'i' is 'x'
 !           index 'j' is 'y'
@@ -24,13 +24,7 @@
 ! Rosenberg DL, Mininni PD, Reddy R, Pouquet A.: Atmosph.11, 178 (2020)
 !=================================================================
 
-!
-! Definitions for conditional compilation
-#include "ghost3D.h"
-
-!
 ! Modules
-
       USE commtypes
       USE filefmt
       USE iovar
@@ -39,16 +33,30 @@
       USE offloading
       USE boxsize
       USE status
+      USE pstatus
       USE gtimer
+      USE gbench
       USE ic_factory
       USE force_factory
       USE equation_factory
+      USE particle_factory
+      USE icp_factory
       USE stepper_factory
-!     USE class_GPart
-
       IMPLICIT NONE
 
-!
+! Arrays for the field and particle states, workspace, I/O, and solver classes
+      TYPE   (GStateComp), ALLOCATABLE :: field(:),field_nxt(:),force (:)
+      TYPE  (GPStateComp), ALLOCATABLE :: part (:),part_nxt (:)
+      TYPE   (GWorkspace)              :: workspace
+      TYPE       (ioplan)              :: planio
+      CLASS(EquationBase), ALLOCATABLE :: fluid
+      CLASS(ParticleBase), ALLOCATABLE :: particle
+      CLASS(GStepperBase), ALLOCATABLE :: stepper
+      CLASS     (icChain), ALLOCATABLE :: iclist(:)
+      CLASS  (forceChain), ALLOCATABLE :: forcemethod(:)
+      CLASS    (icpChain), ALLOCATABLE :: icplist(:)
+
+! Synchro ------------------------------------------
 ! Type encapsulating all state for a single nudged simulation member
       TYPE :: GNudgedSim
           TYPE(GStateComp),    ALLOCATABLE :: field(:),field_nxt(:)
@@ -58,36 +66,22 @@
           INTEGER                          :: num_components
       END TYPE GNudgedSim
 
-!
-! Arrays for the field states, workspace, I/O, and PDE solver class
-
-      TYPE(GStateComp),    ALLOCATABLE :: field(:),field_nxt(:),force(:),diff(:)
-      TYPE(GWorkspace)                 :: workspace
-      TYPE(IOPLAN)                     :: planio
-      CLASS(EquationBase), ALLOCATABLE :: pde
-      CLASS(GStepperBase), ALLOCATABLE :: stepper
-      CLASS(icChain),      ALLOCATABLE :: iclist(:)
-      CLASS(forceChain),   ALLOCATABLE :: forcemethod(:)
-
+      TYPE(GStateComp), ALLOCATABLE :: diff(:)
       TYPE(GNudgedSim), ALLOCATABLE :: ensemble(:)
+! Synchro ------------------------------------------
 
-!
 ! Auxiliary variables
+      REAL(KIND=GP) :: time
+      INTEGER       :: t, num_components
 
-      INTEGER :: idevice, iret, ncuda, ngcuda, ppn
-      INTEGER :: num_components
+! Synchro ------------------------------------------
       INTEGER :: num_realizations, kndg
       INTEGER :: ir, ip
-      INTEGER :: t,timep,pstep,lgmult
       CHARACTER(LEN=8)   :: outlabel
       CHARACTER(LEN=128) :: odir_save
-      INTEGER :: ihcpu1,ihcpu2
-      INTEGER :: ihomp1,ihomp2
-      INTEGER :: ihwtm1,ihwtm2
-      LOGICAL :: bbenchexist
       NAMELIST / ensembleparams / num_realizations, kndg
+! Synchro ------------------------------------------
 
-!
 ! Initialization
 ! Initializes the MPI and I/O libraries
       CALL MPI_INIT_THREAD(MPI_THREAD_FUNNELED,provided,ierr)
@@ -106,10 +100,11 @@
       CALL init_offload(myrank,numdev,hostdev,targetdev)
 #endif
 
-! Initialization of time integration parameters
-      CALL status_init('parameter.inp')
+! Initialization of fluid and particles integration parameters
+      CALL status_init ('parameter.inp')
+      CALL pstatus_init('parameter.inp')
 
-! Read ensemble size from parameter file
+! Synchro ------------------------------------------
       num_realizations = 1
       kndg      = 1
       IF (myrank.eq.0) THEN
@@ -119,79 +114,72 @@
       ENDIF
       CALL MPI_BCAST(num_realizations,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
       CALL MPI_BCAST(kndg     ,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+! Synchro ------------------------------------------
 
 ! I/O initialization
       CALL range(1,nx/2+1,nprocs,myrank,ista,iend)
       CALL range(1,nz,nprocs,myrank,ksta,kend)
       CALL io_init(myrank,(/nx,ny,nz/),ksta,kend,planio)
 
-! Now we can initialize the PDE method
-     pde          = init_pdes_from_file(   'parameter.inp')
-     CALL workspace%initialize_pool(NUMTMPREAL,NUMTMPCOMP)
-     CALL pde%Solver_ctor('parameter.inp',workspace,planio)
-     num_components = pde%state_size()
-     CALL GState_alloc(field    , num_components)
-     CALL GState_alloc(field_nxt, num_components)
-     CALL GState_alloc(force    , num_components)
-     CALL GState_alloc(diff     , num_components)
-     ALLOCATE(icChain :: iclist(1))
-     ALLOCATE(read_v  :: iclist(1)%ic)
-     forcemethod  = init_forcing_from_file('parameter.inp',workspace)
+! Now we can initialize the PDE methods and read the particles status
+      fluid        = init_pdes_from_file('parameter.inp')
+      if (dopart) particle = init_particles_from_file('parameter.inp')
+      CALL workspace%initialize_pool(NUMTMPREAL,NUMTMPCOMP,NUMTMPPART)
+      CALL fluid%Solver_ctor('parameter.inp',workspace,planio)
+      num_components = fluid%state_size()
+      CALL GState_alloc(field    , num_components)
+      CALL GState_alloc(field_nxt, num_components)
+      CALL GState_alloc(force    , num_components)
+      iclist       = init_ic_from_file(     'parameter.inp')
+      forcemethod  = init_forcing_from_file('parameter.inp',workspace)
 
+! Synchro ------------------------------------------
      ALLOCATE(ensemble(num_realizations))
      DO ir = 1, SIZE(ensemble)
        ! BLOCK and MOVE_ALLOC are needed becauce the base class
        ! does not initilize the pointers to null ("=> null()" in declaration)
        ! This is a workaround
+       ! Maybe I can delete them now
+       WRITE(outlabel,'(I3.3)') ir
        BLOCK
          CLASS(EquationBase), ALLOCATABLE :: tmp_pde
-         tmp_pde = init_pdes_from_file('parameter.inp')
+         tmp_pde = init_pdes_from_file('parameter'//TRIM(outlabel)//'.inp')
          CALL MOVE_ALLOC(tmp_pde, ensemble(ir)%pde)
        END BLOCK
-       CALL ensemble(ir)%pde%Solver_ctor('parameter.inp',workspace,planio)
+       CALL ensemble(ir)%pde%Solver_ctor('parameter'//TRIM(outlabel)//'.inp', &
+                                         workspace, planio)
        ensemble(ir)%num_components = ensemble(ir)%pde%state_size()
        CALL GState_alloc(ensemble(ir)%field    , ensemble(ir)%num_components)
        CALL GState_alloc(ensemble(ir)%field_nxt, ensemble(ir)%num_components)
        BLOCK
          CLASS(icChain),    ALLOCATABLE :: tmp_ic(:)
-         tmp_ic  = init_ic_from_file(     'parameter.inp')
+         tmp_ic  = init_ic_from_file('parameter'//TRIM(outlabel)//'.inp')
          CALL MOVE_ALLOC(tmp_ic,  ensemble(ir)%iclist)
        END BLOCK
      END DO
-
-! Create ensemble output directories (odir_ensNNN, odir_difNNN)
-     IF (myrank.eq.0) THEN
-        DO ir = 1, SIZE(ensemble)
-           WRITE(outlabel,'(A,I3.3)') '_ens', ir
-           CALL EXECUTE_COMMAND_LINE('mkdir -p '//TRIM(odir)//TRIM(outlabel))
-           WRITE(outlabel,'(A,I3.3)') '_dif', ir
-           CALL EXECUTE_COMMAND_LINE('mkdir -p '//TRIM(odir)//TRIM(outlabel))
-        END DO
-     END IF
-     CALL MPI_BARRIER(MPI_COMM_WORLD,ierr)
+! Synchro ------------------------------------------
 
 ! Initialization of the numerical domain
-     CALL box_init('parameter.inp')
+      CALL box_init('parameter.inp')
 
-! Initializes the FFT library. This must be done at
-! this stage as it requires the variable "bench" to
-! be properly initialized.
+! Initialization of the particles
+      if (dopart) then
+         CALL particle%part_ctor('parameter.inp',fluid,workspace,part,part_nxt)
+         icplist = init_icp_from_file('parameter.inp')
+      endif
+
+! Initializes the FFT library. This must be done at this
+! stage as it requires status and benchmark initialization.
 ! Use FFTW_ESTIMATE or FFTW_MEASURE in short runs
 ! Use FFTW_PATIENT or FFTW_EXHAUSTIVE in long runs
-
       nth = 1
 !$    nth = omp_get_max_threads()
 #if !defined(DEF_GHOST_CUDA_)
 !$    CALL fftp3d_init_threads(ierr)
 #endif
+      CALL GTBenchInit(bench,ihcpu1,ihomp1,ihwtm1,ihcpu2,ihomp2,ihwtm2)
       IF (bench.eq.2) THEN
-         CALL MPI_BARRIER(MPI_COMM_WORLD,ierr)
-         CALL GTInitHandle(ihcpu2,GT_CPUTIME)
-         CALL GTInitHandle(ihomp2,GT_OMPTIME)
-         CALL GTInitHandle(ihwtm2,GT_WTIME)
-         CALL GTStart(ihcpu2)
-         CALL GTStart(ihomp2)
-         CALL GTStart(ihwtm2)
+         CALL GTStart(ihcpu2); CALL GTStart(ihomp2); CALL GTStart(ihwtm2)
       ENDIF
       CALL fftp3d_create_plan(planrc,(/nx,ny,nz/),FFTW_REAL_TO_COMPLEX, &
                              FFTW_ESTIMATE)
@@ -199,9 +187,7 @@
                              FFTW_ESTIMATE)
       IF (bench.eq.2) THEN
          CALL MPI_BARRIER(MPI_COMM_WORLD,ierr)
-         CALL GTStop(ihcpu2)
-         CALL GTStop(ihomp2)
-         CALL GTStop(ihwtm2)
+         CALL GTStop(ihcpu2);  CALL GTStop(ihomp2);  CALL GTStop(ihwtm2)
       ENDIF
 
 ! Initial states
@@ -209,7 +195,7 @@
         ini  = 1
         sind = 0                          ! index for the spectrum
         tind = 0                          ! index for the binaries
-!       pind = 0                          ! index for the particles
+        pind = 0                          ! index for the particles
         timet = tstep
         timep = pstep
         timec = cstep
@@ -219,412 +205,131 @@
         ini = int((stat-1)*tstep) + 1
         tind = int(stat)
         sind = int(real(ini,kind=GP)/real(sstep,kind=GP)+1)
-!       pind = int((stat-1)*lgmult+1)
+        pind = int((stat-1)*lgmult+1)
         timet = 0
         timep = 0
         timec = int(modulo(float(ini-1),float(cstep)))
         times = int(modulo(float(ini-1),float(sstep)))
         timef = int(modulo(float(ini-1),float(fstep)))
       ENDIF IC
-      CALL init_allstates(iclist,pde,field)
-      CALL init_forcing(forcemethod,pde,force)
+      CALL init_allstates(iclist,fluid,field)
+      field_nxt = field  ! We update nxt to work with I/O and all steppers
+      CALL init_forcing(forcemethod,fluid,force)
+      if (dopart) then
+         CALL init_allpstates(icplist,fluid,field,particle,part)
+	 if (size(part(1)%rcomp) .ne. size(part_nxt(1)%rcomp)) then
+	   call GPState_resize(part_nxt,particle%partbuff_) ! We resize part_nxt
+	 endif
+	 part_nxt = part ! We also update part_nxt
+     endif
 
-      DO ir = 1, SIZE(ensemble)
-        CALL init_allstates(ensemble(ir)%iclist, ensemble(ir)%pde, ensemble(ir)%field)
-        BLOCK
-          CLASS(GStepperBase), ALLOCATABLE :: tmp_stp
-          tmp_stp = build_stepper_from_file('parameter.inp',workspace,ensemble(ir)%pde)
-          CALL MOVE_ALLOC(tmp_stp, ensemble(ir)%stepper)
-        END BLOCK
-      END DO
+! Synchro ------------------------------------------
+! Initialize states and stepper
+     DO ir = 1, SIZE(ensemble)
+       WRITE(outlabel,'(I3.3)') ir
+       CALL init_allstates(ensemble(ir)%iclist, ensemble(ir)%pde, ensemble(ir)%field)
+       BLOCK
+         CLASS(GStepperBase), ALLOCATABLE :: tmp_stp
+         tmp_stp = build_stepper_from_file('parameter'//TRIM(outlabel)//'.inp', &
+                                           workspace, &
+                                           ensemble(ir)%pde)
+         CALL MOVE_ALLOC(tmp_stp, ensemble(ir)%stepper)
+       END BLOCK
+     END DO
 
 ! Initial replace scales
      DO ir = 1, SIZE(ensemble)
         CALL replace_scales(field, ensemble(ir)%field, kndg)
      END DO
+! Synchro ------------------------------------------
 
 ! Sets up the time stepper
-      stepper = build_stepper_from_file('parameter.inp',workspace,pde)
+      if (dopart) then
+        stepper = build_stepper_from_file('parameter.inp',workspace,fluid,particle)
+      else
+        stepper = build_stepper_from_file('parameter.inp',workspace,fluid)
+      endif
 
 ! Time integration scheme starts here.
-! If we are doing a benchmark, we measure
-! cputime before starting.
-
+! If we are doing a benchmark, we measure cputime before
+! starting. We also re-inititialize the fftp timers.
       IF (bench.eq.1) THEN
-         CALL MPI_BARRIER(MPI_COMM_WORLD,ierr)
-         CALL GTInitHandle(ihcpu1,GT_CPUTIME)
-         CALL GTInitHandle(ihomp1,GT_OMPTIME)
-         CALL GTInitHandle(ihwtm1,GT_WTIME)
-         ffttime  = 0.D00 ! re-inititialize fftp timers
-         tratime  = 0.0D0
-         comtime  = 0.D00
-         tottime  = 0.0D0
-#if defined(DEF_GHOST_CUDA_)
-         memtime  = 0.0D0
-         asstime  = 0.D00
-#endif
-         CALL GTStart(ihcpu1)
-         CALL GTStart(ihomp1)
-         CALL GTStart(ihwtm1)
+         ffttime  = 0.D00; tratime  = 0.0D0; comtime  = 0.D00; tottime  = 0.0D0
+         CALL GTStart(ihcpu1); CALL GTStart(ihomp1); CALL GTStart(ihwtm1)
       ENDIF
 
  RK : DO t = ini,step
-
+         time = (t-1)*dt
 ! Every 'tstep' steps, stores the fields in binary files
-
          IF ((timet.eq.tstep).and.(bench.eq.0)) THEN
             timet = 0
             tind = tind+1
-            CALL pde%write_states(field, planio)
-            DO ir = 1, SIZE(ensemble)
-               odir_save = odir
-               WRITE(outlabel,'(A,I3.3)') '_ens', ir
-               odir = TRIM(odir_save)//TRIM(outlabel)
-               CALL ensemble(ir)%pde%write_states(ensemble(ir)%field, planio)
-               DO ip = 1, num_components
-                  diff(ip)%ccomp = ensemble(ir)%field(ip)%ccomp - field(ip)%ccomp
-               END DO
-               WRITE(outlabel,'(A,I3.3)') '_dif', ir
-               odir = TRIM(odir_save)//TRIM(outlabel)
-               CALL pde%write_states(diff, planio)
-               odir = odir_save
-            END DO
-         ENDIF
+	    CALL fluid%write_states(field_nxt, planio)
+        DO ir = 1, SIZE(ensemble)
+           CALL ensemble(ir)%pde%write_states(ensemble(ir)%field, planio)
+        END DO
+	 ENDIF
+
+! Every 'pstep' steps, stores the particle states
+         if (dopart) then
+            IF ((timep.eq.pstep).and.(bench.eq.0)) THEN
+               timep = 0
+	       pind = pind+1
+  	       CALL particle%write_pstate(time,fluid,field_nxt,part_nxt)
+	    ENDIF
+	 endif
 
 ! Every 'cstep' steps writes global quantities
-
          IF ((timec.eq.cstep).and.(bench.eq.0)) THEN
             timec = 0
-            CALL hdcheck_ndg(field, force, t, dt, 0, 0, '_ref')
-            DO ir = 1, SIZE(ensemble)
-               WRITE(outlabel,'(A,I3.3,A)') '_ens', ir
-               CALL hdcheck_ndg(ensemble(ir)%field, force, t, dt, 0, 0, outlabel)
-               DO ip = 1, num_components
-                  diff(ip)%ccomp = ensemble(ir)%field(ip)%ccomp - field(ip)%ccomp
-               END DO
-               WRITE(outlabel,'(A,I3.3,A)') '_dif', ir
-               CALL hdcheck_ndg(diff, force, t, dt, 0, 0, outlabel)
-            END DO
+	    CALL fluid%global(field_nxt, force, t)
          ENDIF
 
 ! Every 'sstep' steps writes spectra
-
          IF ((times.eq.sstep).and.(bench.eq.0)) THEN
             times = 0
             sind = sind+1
-            WRITE(ext, fmtext) sind
-            CALL hdspectrum_ndg(field, '_ref')
-            DO ir = 1, SIZE(ensemble)
-               WRITE(outlabel,'(A,I3.3)') '_ens', ir
-               CALL hdspectrum_ndg(ensemble(ir)%field, outlabel)
-               DO ip = 1, num_components
-                  diff(ip)%ccomp = ensemble(ir)%field(ip)%ccomp - field(ip)%ccomp
-               END DO
-               WRITE(outlabel,'(A,I3.3)') '_dif', ir
-               CALL hdspectrum_ndg(diff, outlabel)
-            END DO
+            CALL fluid%spectra(field_nxt)
          ENDIF
 
 ! Time evolution
-         CALL update_forcing(forcemethod,pde,force)
-         CALL stepper%step(time, field, force, dt, field_nxt)
-    
-         DO ir = 1, SIZE(ensemble)
-            CALL ensemble(ir)%stepper%step(time, &
-                                           ensemble(ir)%field, &
-                                           force, &
-                                           dt, &
-                                           ensemble(ir)%field_nxt)
-
-            ! Replace scales from reference into ensembles:
-            ! as there's an initial replace_scales before
-            ! the time stepping loop begins I do this here
-            ! in order to ensure the output always has the right
-            ! information in the large scales, otherwise there's some leakage
-            CALL replace_scales(field_nxt, ensemble(ir)%field_nxt, kndg)
-            ensemble(ir)%field = ensemble(ir)%field_nxt
-         END DO
-
-         field = field_nxt
-         timet = timet+1
-         timep = timep+1
-         timec = timec+1
-         times = times+1
-
+         CALL update_forcing(forcemethod,fluid,force)
+         if (dopart) then
+            field = field_nxt
+	    part  = part_nxt
+            CALL stepper%gstep(time, field, part, force, dt, field_nxt, part_nxt)
+	 else
+	    field = field_nxt
+            CALL stepper%gstep(time, field, force, dt, field_nxt)
+	 endif
+         timet = timet+1; timep = timep+1; timec = timec+1; times = times+1
       END DO RK
 
-!
-! End of Runge-Kutta
-
-! Computes the benchmark
-
+! Finishes and writes the benchmark results
       IF (bench.gt.0) THEN
          CALL MPI_BARRIER(MPI_COMM_WORLD,ierr)
-         CALL GTStop(ihcpu1)
-         CALL GTStop(ihomp1)
-         CALL GTStop(ihwtm1)
-         inquire( file='benchmark.txt', exist=bbenchexist )
-         IF (myrank.eq.0) THEN
-            OPEN(1,file='benchmark.txt',position='append')
-#if defined(DEF_GHOST_CUDA_)
-            IF ( .NOT. bbenchexist ) THEN
-               WRITE(1,*) &
-	       '# nx ny nz nsteps nprocs nth nstrm TCPU TOMP TWTIME TFFT TTRA TCOM TMEM TASS TTOT'
-            ENDIF
-            WRITE(1,*) nx,ny,nz,(step-ini+1),nprocs,nth, &
-                       nstreams                        , &
-                       GTGetTime(ihcpu1)/(step-ini+1)  , &
-                       GTGetTime(ihomp1)/(step-ini+1)  , &
-                       GTGetTime(ihwtm1)/(step-ini+1)  , &
-                       ffttime/(step-ini+1), tratime/(step-ini+1), &
-                       comtime/(step-ini+1), memtime/(step-ini+1), &
-                       asstime/(step-ini+1), tottime/(step-ini+1)
-            WRITE(*,*) 'wtime=', GTGetTime(ihwtm1)/(step-ini+1),   &
-	               ' fft=', ffttime/(step-ini+1),    &
-		       ' transp=',tratime/(step-ini+1),  &
-		       ' comm=',comtime/(step-ini+1),    &
-		       ' mem=', memtime/(step-ini+1),    &
-		       ' ttot=',tottime/(step-ini+1)
-#else
-            IF ( .NOT. bbenchexist ) THEN
-               WRITE(1,*) &
-	       '# nx ny nz nsteps nprocs nth TCPU TOMP TWTIME TFFT TTRA TCOM TTOT'
-            ENDIF
-            WRITE(1,*) nx,ny,nz,(step-ini+1),nprocs,nth, &
-                       GTGetTime(ihcpu1)/(step-ini+1),   &
-                       GTGetTime(ihomp1)/(step-ini+1),   &
-                       GTGetTime(ihwtm1)/(step-ini+1),   &
-                       ffttime/(step-ini+1), tratime/(step-ini+1), &
-                       comtime/(step-ini+1), tottime/(step-ini+1)
-            WRITE(*,*) 'wtime=', GTGetTime(ihwtm1)/(step-ini+1),   &
-	               ' fft=', ffttime/(step-ini+1),    &
-		       ' transp=',tratime/(step-ini+1),  &
-		       ' comm=',comtime/(step-ini+1),    &
-		       ' mem=',0.0, ' ttot=',tottime/(step-ini+1)
-#endif
-            IF (bench.eq.2) THEN
-               WRITE(1,*) 'FFTW: Create_plan = ',      &
-                       GTGetTime(ihcpu2)/(step-ini+1), &
-                       GTGetTime(ihomp2)/(step-ini+1), &
-                       GTGetTime(ihwtm2)/(step-ini+1)
-            ENDIF
-            CLOSE(1)
-         ENDIF
+         CALL GTStop(ihcpu1); CALL GTStop(ihomp1); CALL GTStop(ihwtm1)
+      ENDIF
+      CALL GTBenchReport(bench,myrank,ini,step,ihcpu1,ihomp1,ihwtm1,             &
+               ihcpu2,ihomp2,ihwtm2)
+      IF (dopart) THEN
+        rbal = rbal + GetLoadBal(particle) ! Get load balancing
+        CALL GTBenchReportParticles(bench, myrank, ini, step, maxparts, rbal,    &
+             [ GetTime(particle,GPTIME_STEP),   GetTime(particle,GPTIME_COMM),   &
+	       GetTime(particle,GPTIME_SPLINE), GetTime(particle,GPTIME_TRANSP), &
+	       GetTime(particle,GPTIME_DATAEX), GetTime(particle,GPTIME_INTERP), &
+	       GetTime(particle,GPTIME_PUPDATE) ], 'gpbenchmark.txt')
       ENDIF
 
-!
-! End of MAIN3D
-
+! End of main
       CALL GTFree(ihcpu1)
       CALL GTFree(ihomp1)
       CALL GTFree(ihwtm1)
       CALL GTFree(ihcpu2)
       CALL GTFree(ihomp2)
       CALL GTFree(ihwtm2)
-
       CALL MPI_FINALIZE(ierr)
       CALL fftp3d_destroy_plan(plancr)
       CALL fftp3d_destroy_plan(planrc)
-
-      CONTAINS
-
-!=================================================================
-! SUBROUTINE: hdcheck_ndg
-!
-! Consistency check for the conservation of energy,
-! helicity, and null divergence of the velocity field.
-! Adapted from hdcheck in pseudospec3D_hd.f90 to take
-! GStateComp field arrays and a filename label, for use
-! with ensemble members and difference fields.
-!
-! Output files contain:
-! '<label>balance.txt':    time, <v^2>, <omega^2>, injection rate
-! '<label>helicity.txt':   time, kinetic helicity
-! '<label>divergence.txt': time, <(div.v)^2>   [if chk=1]
-!
-! Parameters:
-!   vel  : velocity field (3 components)
-!   frc  : forcing field  (3 components)
-!   t    : number of time steps made
-!   dt   : time step
-!   hel  : =0 skips helicity; =1 computes kinetic helicity
-!   chk  : =0 skips divergence check; =1 performs it
-!   label: prefix string for output filenames
-!=================================================================
-      SUBROUTINE hdcheck_ndg(vel, frc, t, dt, hel, chk, label)
-
-          USE fprecision
-          USE commtypes
-          USE grid
-          USE mpivars
-          USE gstate_mod
-          USE pseudospec_fluid
-!$        USE threads
-
-          IMPLICIT NONE
-
-          TYPE(GStateComp), INTENT(IN) :: vel(:), frc(:)
-          REAL(KIND=GP),    INTENT(IN) :: dt
-          INTEGER,          INTENT(IN) :: t, hel, chk
-          CHARACTER(LEN=*), INTENT(IN) :: label
-
-          COMPLEX(KIND=GP), DIMENSION(nz,ny,ista:iend) :: c1,c2,c3
-          DOUBLE PRECISION :: eng,ens,pot,khe
-          DOUBLE PRECISION :: div,tmp
-          REAL(KIND=GP)    :: tmq
-          INTEGER          :: i,j,k
-
-          div = 0.0D0
-          tmp = 0.0D0
-          tmq = 1.0_GP/ &
-                (real(nx,kind=GP)*real(ny,kind=GP)*real(nz,kind=GP))**2
-
-!
-! Computes the mean square value of the divergence
-!
-          IF (chk.eq.1) THEN
-
-          CALL derivk3(vel(1)%ccomp,c1,1)
-          CALL derivk3(vel(2)%ccomp,c2,2)
-          CALL derivk3(vel(3)%ccomp,c3,3)
-          IF (ista.eq.1) THEN
-!$omp parallel do private (k) reduction(+:tmp)
-             DO j = 1,ny
-                DO k = 1,nz
-                   tmp = tmp+abs(c1(k,j,1)+c2(k,j,1)+c3(k,j,1))**2*tmq
-                END DO
-             END DO
-!$omp parallel do if (iend-2.ge.nth) private (j,k) reduction(+:tmp)
-             DO i = 2,iend
-!$omp parallel do if (iend-2.lt.nth) private (k) reduction(+:tmp)
-                DO j = 1,ny
-                   DO k = 1,nz
-                      tmp = tmp+2*abs(c1(k,j,i)+c2(k,j,i)+c3(k,j,i))**2*tmq
-                   END DO
-                END DO
-             END DO
-          ELSE
-!$omp parallel do if (iend-ista.ge.nth) private (j,k) reduction(+:tmp)
-             DO i = ista,iend
-!$omp parallel do if (iend-ista.lt.nth) private (k) reduction(+:tmp)
-                DO j = 1,ny
-                   DO k = 1,nz
-                      tmp = tmp+2*abs(c1(k,j,i)+c2(k,j,i)+c3(k,j,i))**2*tmq
-                   END DO
-                END DO
-             END DO
-          ENDIF
-          CALL MPI_REDUCE(tmp,div,1,MPI_DOUBLE_PRECISION,MPI_SUM,0, &
-                          MPI_COMM_WORLD,ierr)
-
-          ENDIF
-
-!
-! Computes mean energy, enstrophy, and kinetic helicity
-!
-          CALL energy(vel(1)%ccomp,vel(2)%ccomp,vel(3)%ccomp,eng,1)
-          CALL energy(vel(1)%ccomp,vel(2)%ccomp,vel(3)%ccomp,ens,0)
-          IF (hel.eq.1) THEN
-             CALL helicity(vel(1)%ccomp,vel(2)%ccomp,vel(3)%ccomp,khe)
-          ENDIF
-
-!
-! Computes the energy injection rate
-!
-          CALL cross(vel(1)%ccomp,vel(2)%ccomp,vel(3)%ccomp, &
-                     frc(1)%ccomp,frc(2)%ccomp,frc(3)%ccomp,pot,1)
-
-!
-! Writes results to labelled output files
-!
-          IF (myrank.eq.0) THEN
-             OPEN(1,file='balance'//TRIM(label)//'.txt',position='append')
-             WRITE(1,10) (t-1)*dt,eng,ens,pot
-   10        FORMAT( E13.6,E26.18,E26.18,E26.18 )
-             CLOSE(1)
-             IF (hel.eq.1) THEN
-                OPEN(1,file='helicity'//TRIM(label)//'.txt',position='append')
-                WRITE(1,FMT='(E13.6,E26.18)') (t-1)*dt,khe
-                CLOSE(1)
-             ENDIF
-             IF (chk.eq.1) THEN
-                OPEN(1,file='divergence'//TRIM(label)//'.txt',position='append')
-                WRITE(1,FMT='(E13.6,E26.18)') (t-1)*dt,div
-                CLOSE(1)
-             ENDIF
-          ENDIF
-
-      END SUBROUTINE hdcheck_ndg
-
-!=================================================================
-! SUBROUTINE: hdspectrum_ndg
-!
-! Computes and writes the kinetic energy spectrum for a field
-! given as a GStateComp array, appending a label to the filename.
-! Output file: 'kspectrum.<ext><label>.txt'
-!
-! Parameters:
-!   vel  : velocity field (3 components)
-!   label: suffix appended to the spectrum index in the filename
-!=================================================================
-      SUBROUTINE hdspectrum_ndg(vel, label)
-
-          USE fprecision
-          USE mpivars
-          USE gstate_mod
-          USE filefmt
-          USE pseudospec_fluid
-
-          IMPLICIT NONE
-
-          TYPE(GStateComp), INTENT(IN) :: vel(:)
-          CHARACTER(LEN=*), INTENT(IN) :: label
-
-          CALL spectrum(vel(1)%ccomp, vel(2)%ccomp, vel(3)%ccomp, &
-                        TRIM(ext)//TRIM(label), 1, 1)
-
-      END SUBROUTINE hdspectrum_ndg
-
-!=================================================================
-! SUBROUTINE: replace_scales
-!
-! Replaces the spectral modes of 'dst' with those of 'src' for
-! all wavenumber shells k <= kndg. Modes at shells k > kndg in
-! 'dst' are left unchanged. Both states must have the same number
-! of components and be defined on the same distributed grid.
-!
-! Parameters:
-!   src  : source field state (reference simulation)
-!   dst  : destination field state (nudged simulation member)
-!   kndg : cutoff wavenumber shell (integer)
-!=================================================================
-      SUBROUTINE replace_scales(src, dst, kcut)
-
-          USE fprecision
-          USE mpivars
-          USE grid
-          USE kes
-          USE boxsize
-          USE gstate_mod
-
-          TYPE(GStateComp), INTENT(IN)    :: src(:)
-          TYPE(GStateComp), INTENT(INOUT) :: dst(:)
-          INTEGER,          INTENT(IN)    :: kcut
-
-          INTEGER :: ic, i, j, k
-
-          DO ic = 1, SIZE(src)
-              DO i = ista, iend
-                  DO j = 1, ny
-                      DO k = 1, nz
-                          IF (int(sqrt(kk2(k,j,i))/Dkk+0.5_GP) .le. kcut) THEN
-                              dst(ic)%ccomp(k,j,i) = src(ic)%ccomp(k,j,i)
-                          ENDIF
-                      END DO
-                  END DO
-              END DO
-          END DO
-
-      END SUBROUTINE replace_scales
-
+      
       END PROGRAM MAIN
