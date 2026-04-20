@@ -65,7 +65,8 @@
          CLASS(icChain),      ALLOCATABLE :: iclist(:)
          INTEGER                          :: num_components
       CONTAINS
-         PROCEDURE :: global => gnudgedsim_global
+         PROCEDURE :: global  => gnudgedsim_global
+         PROCEDURE :: spectra => gnudgedsim_spectra
       END TYPE GNudgedSim
 
       TYPE(GNudgedSim), ALLOCATABLE :: ensemble(:)
@@ -276,6 +277,9 @@ RK :  DO t = ini,step
             times = 0
             sind = sind+1
             CALL fluid%spectra(field_nxt)
+            DO ir = 1, SIZE(ensemble)
+               CALL ensemble(ir)%spectra(field_nxt)
+            END DO
          ENDIF
 
 ! Time evolution
@@ -371,6 +375,89 @@ RK :  DO t = ini,step
           CALL this%pde%workspace_%free_complex_tmp(vx)
 
       END SUBROUTINE gnudgedsim_global
+
+!=================================================================
+! SUBROUTINE: gnudgedsim_spectra
+!
+! Type-bound spectral diagnostic for a nudged ensemble member.
+! Delegates to pde%spectra for the ensemble field (full output
+! including energy transfer), then computes the difference
+! spectrum (ensemble - reference) and writes it to
+! 'dspectrum.XXX.txt' in the member's todir_.
+!
+! Parameters:
+!   this      : nudged simulation member
+!   ref_field : reference simulation's current field (field_nxt)
+!=================================================================
+      SUBROUTINE gnudgedsim_spectra(this, ref_field)
+
+          USE fprecision
+
+          IMPLICIT NONE
+
+          CLASS(GNudgedSim), INTENT(IN) :: this
+          TYPE (GStateComp), INTENT(IN) :: ref_field(:)
+
+          COMPLEX(KIND=GP), POINTER :: vx(:,:,:), vy(:,:,:), vz(:,:,:)
+          LOGICAL :: bret
+
+          CALL this%pde%spectra(this%field_nxt)
+
+          CALL this%pde%workspace_%get_complex_tmp(vx, bret)
+          CALL this%pde%workspace_%get_complex_tmp(vy, bret)
+          CALL this%pde%workspace_%get_complex_tmp(vz, bret)
+
+          vx = this%field_nxt(1)%ccomp - ref_field(1)%ccomp
+          vy = this%field_nxt(2)%ccomp - ref_field(2)%ccomp
+          vz = this%field_nxt(3)%ccomp - ref_field(3)%ccomp
+
+          CALL spectrum_ndg(vx, vy, vz, this%pde%todir_, ext)
+
+          CALL this%pde%workspace_%free_complex_tmp(vz)
+          CALL this%pde%workspace_%free_complex_tmp(vy)
+          CALL this%pde%workspace_%free_complex_tmp(vx)
+
+      END SUBROUTINE gnudgedsim_spectra
+
+!=================================================================
+! SUBROUTINE: spectrum_ndg
+!
+! Computes the kinetic energy spectrum and writes it to
+! 'dspectrum.XXX.txt'. Same normalization as spectrum():
+! E = sum[E(k).Dkk].
+!
+! Parameters:
+!   a,b,c : velocity field components (spectral)
+!   path  : output directory
+!   nmb   : file extension (e.g. '001')
+!=================================================================
+      SUBROUTINE spectrum_ndg(a, b, c, path, nmb)
+
+          USE fprecision
+          USE grid
+          USE mpivars
+          USE boxsize
+          USE pseudospec_hd
+
+          IMPLICIT NONE
+
+          COMPLEX(KIND=GP), INTENT(IN), DIMENSION(nz,ny,ista:iend) :: a,b,c
+          CHARACTER(LEN=*), INTENT(IN) :: path, nmb
+
+          DOUBLE PRECISION, DIMENSION(nmax/2+1) :: Ek, Hk
+          INTEGER :: i
+
+          CALL spectrumc(a, b, c, 1, 0, Ek, Hk)
+
+          IF (myrank.eq.0) THEN
+             OPEN(1,file=TRIM(path)//'/dspectrum.'//nmb//'.txt')
+             DO i = 1, nmax/2+1
+                WRITE(1,FMT='(E13.6,E23.15)') Dkk*i, 0.5_GP*Ek(i)/Dkk
+             END DO
+             CLOSE(1)
+          ENDIF
+
+      END SUBROUTINE spectrum_ndg
 
 !=================================================================
 ! SUBROUTINE: hdcheck_ndg
