@@ -120,8 +120,10 @@
 !=================================================================
       SUBROUTINE spectrum_ndg(a, b, c, path, nmb)
 
+          USE kes
           USE grid
           USE mpivars
+          USE filefmt
           USE boxsize
           USE pseudospec_hd
 
