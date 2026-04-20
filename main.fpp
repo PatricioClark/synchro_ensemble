@@ -1,4 +1,289 @@
 !=================================================================
+! MODULE: synchro_mod
+!
+! Module for the spectral nudging / scale synchronization
+! ensemble extension. Defines the GNudgedSim type and its
+! diagnostic methods (global, spectra) as well as helper
+! routines (hdcheck_ndg, spectrum_ndg, replace_scales).
+!=================================================================
+      MODULE synchro_mod
+
+      USE fprecision
+      USE gstate_mod
+      USE equationbase_mod
+      USE gstepperbase_mod
+      USE ic_factory
+      IMPLICIT NONE
+
+! Type encapsulating all state for a single nudged simulation member
+      TYPE :: GNudgedSim
+         TYPE(GStateComp),    ALLOCATABLE :: field(:),field_nxt(:)
+         CLASS(EquationBase), ALLOCATABLE :: pde
+         CLASS(GStepperBase), ALLOCATABLE :: stepper
+         CLASS(icChain),      ALLOCATABLE :: iclist(:)
+         INTEGER                          :: num_components
+      CONTAINS
+         PROCEDURE :: global  => gnudgedsim_global
+         PROCEDURE :: spectra => gnudgedsim_spectra
+      END TYPE GNudgedSim
+
+      CONTAINS
+
+!=================================================================
+! SUBROUTINE: gnudgedsim_global
+!
+! Type-bound global diagnostic for a nudged ensemble member.
+! Delegates to pde%global for the ensemble field (which writes
+! to the member's own todir_), then computes the difference
+! field (ensemble - reference) using workspace temporaries and
+! writes its global quantities to 'difference.txt' in the same
+! directory via hdcheck_ndg.
+!=================================================================
+      SUBROUTINE gnudgedsim_global(this, ref_field, force, t)
+
+          USE status
+
+          IMPLICIT NONE
+
+          CLASS(GNudgedSim), INTENT(IN) :: this
+          TYPE (GStateComp), INTENT(IN) :: ref_field(:), force(:)
+          INTEGER,           INTENT(IN) :: t
+
+          COMPLEX(KIND=GP), POINTER :: vx(:,:,:), vy(:,:,:), vz(:,:,:)
+          LOGICAL :: bret
+
+          CALL this%pde%global(this%field_nxt, force, t)
+
+          CALL this%pde%workspace_%get_complex_tmp(vx, bret)
+          CALL this%pde%workspace_%get_complex_tmp(vy, bret)
+          CALL this%pde%workspace_%get_complex_tmp(vz, bret)
+
+          vx = this%field_nxt(1)%ccomp - ref_field(1)%ccomp
+          vy = this%field_nxt(2)%ccomp - ref_field(2)%ccomp
+          vz = this%field_nxt(3)%ccomp - ref_field(3)%ccomp
+
+          CALL hdcheck_ndg(vx, vy, vz, &
+                           force(1)%ccomp, force(2)%ccomp, force(3)%ccomp, &
+                           t, dt, 0, 0, this%pde%todir_)
+
+          CALL this%pde%workspace_%free_complex_tmp(vz)
+          CALL this%pde%workspace_%free_complex_tmp(vy)
+          CALL this%pde%workspace_%free_complex_tmp(vx)
+
+      END SUBROUTINE gnudgedsim_global
+
+!=================================================================
+! SUBROUTINE: gnudgedsim_spectra
+!
+! Type-bound spectral diagnostic for a nudged ensemble member.
+! Delegates to pde%spectra for the ensemble field (full output
+! including energy transfer), then computes the difference
+! spectrum (ensemble - reference) and writes it to
+! 'dspectrum.XXX.txt' in the member's todir_.
+!=================================================================
+      SUBROUTINE gnudgedsim_spectra(this, ref_field)
+
+          USE filefmt
+
+          IMPLICIT NONE
+
+          CLASS(GNudgedSim), INTENT(IN) :: this
+          TYPE (GStateComp), INTENT(IN) :: ref_field(:)
+
+          COMPLEX(KIND=GP), POINTER :: vx(:,:,:), vy(:,:,:), vz(:,:,:)
+          LOGICAL :: bret
+
+          CALL this%pde%spectra(this%field_nxt)
+
+          CALL this%pde%workspace_%get_complex_tmp(vx, bret)
+          CALL this%pde%workspace_%get_complex_tmp(vy, bret)
+          CALL this%pde%workspace_%get_complex_tmp(vz, bret)
+
+          vx = this%field_nxt(1)%ccomp - ref_field(1)%ccomp
+          vy = this%field_nxt(2)%ccomp - ref_field(2)%ccomp
+          vz = this%field_nxt(3)%ccomp - ref_field(3)%ccomp
+
+          CALL spectrum_ndg(vx, vy, vz, this%pde%todir_, ext)
+
+          CALL this%pde%workspace_%free_complex_tmp(vz)
+          CALL this%pde%workspace_%free_complex_tmp(vy)
+          CALL this%pde%workspace_%free_complex_tmp(vx)
+
+      END SUBROUTINE gnudgedsim_spectra
+
+!=================================================================
+! SUBROUTINE: spectrum_ndg
+!
+! Computes the kinetic energy spectrum and writes it to
+! 'dspectrum.XXX.txt'. Same normalization as spectrum():
+! E = sum[E(k).Dkk].
+!=================================================================
+      SUBROUTINE spectrum_ndg(a, b, c, path, nmb)
+
+          USE grid
+          USE mpivars
+          USE boxsize
+          USE pseudospec_hd
+
+          IMPLICIT NONE
+
+          COMPLEX(KIND=GP), INTENT(IN), DIMENSION(nz,ny,ista:iend) :: a,b,c
+          CHARACTER(LEN=*), INTENT(IN) :: path, nmb
+
+          DOUBLE PRECISION, DIMENSION(nmax/2+1) :: Ek, Hk
+          INTEGER :: i
+
+          CALL spectrumc(a, b, c, 1, 0, Ek, Hk)
+
+          IF (myrank.eq.0) THEN
+             OPEN(1,file=TRIM(path)//'/dspectrum.'//nmb//'.txt')
+             DO i = 1, nmax/2+1
+                WRITE(1,FMT='(E13.6,E23.15)') Dkk*i, 0.5_GP*Ek(i)/Dkk
+             END DO
+             CLOSE(1)
+          ENDIF
+
+      END SUBROUTINE spectrum_ndg
+
+!=================================================================
+! SUBROUTINE: hdcheck_ndg
+!
+! Computes and writes global quantities (energy, enstrophy,
+! injection rate) for a velocity field given as raw spectral
+! arrays, writing to 'difference.txt' in the specified directory.
+!
+! Output files (written to todir):
+!   'difference.txt'  : time, <v^2>, <omega^2>, injection
+!   'helicity.txt'    : time, kinetic helicity     [if hel=1]
+!   'divergence.txt'  : time, <(div.v)^2>          [if chk=1]
+!=================================================================
+      SUBROUTINE hdcheck_ndg(vx, vy, vz, fx, fy, fz, t, dt, hel, chk, todir)
+
+          USE commtypes
+          USE grid
+          USE mpivars
+          USE pseudospec_fluid
+!$        USE threads
+
+          IMPLICIT NONE
+
+          COMPLEX(KIND=GP), DIMENSION(nz,ny,ista:iend), INTENT(INOUT) :: vx,vy,vz
+          COMPLEX(KIND=GP), DIMENSION(nz,ny,ista:iend), INTENT(IN)    :: fx,fy,fz
+          REAL(KIND=GP),    INTENT(IN) :: dt
+          INTEGER,          INTENT(IN) :: t, hel, chk
+          CHARACTER(LEN=*), INTENT(IN) :: todir
+
+          COMPLEX(KIND=GP), DIMENSION(nz,ny,ista:iend) :: c1,c2,c3
+          DOUBLE PRECISION :: eng,ens,pot,khe
+          DOUBLE PRECISION :: div,tmp
+          REAL(KIND=GP)    :: tmq
+          INTEGER          :: i,j,k
+
+          div = 0.0D0
+          tmp = 0.0D0
+          tmq = 1.0_GP/ &
+                (real(nx,kind=GP)*real(ny,kind=GP)*real(nz,kind=GP))**2
+
+          IF (chk.eq.1) THEN
+             CALL derivk3(vx,c1,1)
+             CALL derivk3(vy,c2,2)
+             CALL derivk3(vz,c3,3)
+             IF (ista.eq.1) THEN
+!$omp parallel do private (k) reduction(+:tmp)
+                DO j = 1,ny
+                   DO k = 1,nz
+                      tmp = tmp+abs(c1(k,j,1)+c2(k,j,1)+c3(k,j,1))**2*tmq
+                   END DO
+                END DO
+!$omp parallel do if (iend-2.ge.nth) private (j,k) reduction(+:tmp)
+                DO i = 2,iend
+!$omp parallel do if (iend-2.lt.nth) private (k) reduction(+:tmp)
+                   DO j = 1,ny
+                      DO k = 1,nz
+                         tmp = tmp+2*abs(c1(k,j,i)+c2(k,j,i)+c3(k,j,i))**2*tmq
+                      END DO
+                   END DO
+                END DO
+             ELSE
+!$omp parallel do if (iend-ista.ge.nth) private (j,k) reduction(+:tmp)
+                DO i = ista,iend
+!$omp parallel do if (iend-ista.lt.nth) private (k) reduction(+:tmp)
+                   DO j = 1,ny
+                      DO k = 1,nz
+                         tmp = tmp+2*abs(c1(k,j,i)+c2(k,j,i)+c3(k,j,i))**2*tmq
+                      END DO
+                   END DO
+                END DO
+             ENDIF
+             CALL MPI_REDUCE(tmp,div,1,MPI_DOUBLE_PRECISION,MPI_SUM,0, &
+                             MPI_COMM_WORLD,ierr)
+          ENDIF
+
+          CALL energy(vx,vy,vz,eng,1)
+          CALL energy(vx,vy,vz,ens,0)
+          IF (hel.eq.1) THEN
+             CALL helicity(vx,vy,vz,khe)
+          ENDIF
+          CALL cross(vx,vy,vz,fx,fy,fz,pot,1)
+
+          IF (myrank.eq.0) THEN
+             OPEN(1,file=TRIM(todir)//'/difference.txt',position='append')
+             WRITE(1,10) (t-1)*dt,eng,ens,pot
+   10        FORMAT( E13.6,E26.18,E26.18,E26.18 )
+             CLOSE(1)
+             IF (hel.eq.1) THEN
+                OPEN(1,file=TRIM(todir)//'/helicity.txt',position='append')
+                WRITE(1,FMT='(E13.6,E26.18)') (t-1)*dt,khe
+                CLOSE(1)
+             ENDIF
+             IF (chk.eq.1) THEN
+                OPEN(1,file=TRIM(todir)//'/divergence.txt',position='append')
+                WRITE(1,FMT='(E13.6,E26.18)') (t-1)*dt,div
+                CLOSE(1)
+             ENDIF
+          ENDIF
+
+      END SUBROUTINE hdcheck_ndg
+
+!=================================================================
+! SUBROUTINE: replace_scales
+!
+! Replaces the spectral modes of 'dst' with those of 'src' for
+! all wavenumber shells k <= kcut. Modes at shells k > kcut in
+! 'dst' are left unchanged.
+!=================================================================
+      SUBROUTINE replace_scales(src, dst, kcut)
+
+          USE mpivars
+          USE grid
+          USE kes
+          USE boxsize
+
+          IMPLICIT NONE
+
+          TYPE(GStateComp), INTENT(IN)    :: src(:)
+          TYPE(GStateComp), INTENT(INOUT) :: dst(:)
+          INTEGER,          INTENT(IN)    :: kcut
+
+          INTEGER :: ic, i, j, k
+
+          DO ic = 1, SIZE(src)
+              DO i = ista, iend
+                  DO j = 1, ny
+                      DO k = 1, nz
+                          IF (int(sqrt(kk2(k,j,i))/Dkk+0.5_GP) .le. kcut) THEN
+                              dst(ic)%ccomp(k,j,i) = src(ic)%ccomp(k,j,i)
+                          ENDIF
+                      END DO
+                  END DO
+              END DO
+          END DO
+
+      END SUBROUTINE replace_scales
+
+      END MODULE synchro_mod
+
+!=================================================================
       PROGRAM MAIN
 !=================================================================
 ! GHOST code: Geophysical High Order Suite for Turbulence
@@ -42,6 +327,7 @@
       USE particle_factory
       USE icp_factory
       USE stepper_factory
+      USE synchro_mod
       IMPLICIT NONE
 
 ! Arrays for the field and particle states, workspace, I/O, and solver classes
@@ -57,20 +343,7 @@
       CLASS    (icpChain), ALLOCATABLE :: icplist(:)
 
 ! Synchro ------------------------------------------
-! Type encapsulating all state for a single nudged simulation member
-      TYPE :: GNudgedSim
-         TYPE(GStateComp),    ALLOCATABLE :: field(:),field_nxt(:)
-         CLASS(EquationBase), ALLOCATABLE :: pde
-         CLASS(GStepperBase), ALLOCATABLE :: stepper
-         CLASS(icChain),      ALLOCATABLE :: iclist(:)
-         INTEGER                          :: num_components
-      CONTAINS
-         PROCEDURE :: global  => gnudgedsim_global
-         PROCEDURE :: spectra => gnudgedsim_spectra
-      END TYPE GNudgedSim
-
       TYPE(GNudgedSim), ALLOCATABLE :: ensemble(:)
-! Synchro ------------------------------------------
 
 ! Auxiliary variables
       REAL(KIND=GP) :: time
@@ -78,9 +351,8 @@
 
 ! Synchro ------------------------------------------
       INTEGER :: num_realizations, kndg
-      INTEGER :: ir, ip
+      INTEGER :: ir
       CHARACTER(LEN=8)   :: outlabel
-      CHARACTER(LEN=128) :: odir_save
       NAMELIST / ensembleparams / num_realizations, kndg
 ! Synchro ------------------------------------------
 
@@ -266,7 +538,7 @@ RK :  DO t = ini,step
 ! Every 'cstep' steps writes global quantities
          IF ((timec.eq.cstep).and.(bench.eq.0)) THEN
             timec = 0
-	         CALL fluid%global(field_nxt, force, t)
+     	      CALL fluid%global(field_nxt, force, t)
             DO ir = 1, SIZE(ensemble)
                CALL ensemble(ir)%global(field_nxt, force, t)
             END DO
@@ -284,7 +556,7 @@ RK :  DO t = ini,step
 
 ! Time evolution
          CALL update_forcing(forcemethod,fluid,force)
-	      field = field_nxt
+         field = field_nxt
          CALL stepper%gstep(time, field, force, dt, field_nxt)
 ! Synchro ----------------------------------------------------------
 ! step ensemble members and replace large scales
@@ -324,291 +596,5 @@ RK :  DO t = ini,step
       CALL MPI_FINALIZE(ierr)
       CALL fftp3d_destroy_plan(plancr)
       CALL fftp3d_destroy_plan(planrc)
-
-      CONTAINS
-
-!=================================================================
-! SUBROUTINE: gnudgedsim_global
-!
-! Type-bound global diagnostic for a nudged ensemble member.
-! Delegates to pde%global for the ensemble field (which writes
-! to the member's own todir_), then computes the difference
-! field (ensemble - reference) using workspace temporaries and
-! writes its global quantities to 'difference.txt' in the same
-! directory via hdcheck_ndg.
-!
-! Parameters:
-!   this      : nudged simulation member
-!   ref_field : reference simulation's current field (field_nxt)
-!   force     : forcing field
-!   t         : timestep index
-!=================================================================
-      SUBROUTINE gnudgedsim_global(this, ref_field, force, t)
-
-          USE fprecision
-
-          IMPLICIT NONE
-
-          CLASS(GNudgedSim), INTENT(IN) :: this
-          TYPE (GStateComp), INTENT(IN) :: ref_field(:), force(:)
-          INTEGER,           INTENT(IN) :: t
-
-          COMPLEX(KIND=GP), POINTER :: vx(:,:,:), vy(:,:,:), vz(:,:,:)
-          LOGICAL :: bret
-
-          CALL this%pde%global(this%field_nxt, force, t)
-
-          CALL this%pde%workspace_%get_complex_tmp(vx, bret)
-          CALL this%pde%workspace_%get_complex_tmp(vy, bret)
-          CALL this%pde%workspace_%get_complex_tmp(vz, bret)
-
-          vx = this%field_nxt(1)%ccomp - ref_field(1)%ccomp
-          vy = this%field_nxt(2)%ccomp - ref_field(2)%ccomp
-          vz = this%field_nxt(3)%ccomp - ref_field(3)%ccomp
-
-          CALL hdcheck_ndg(vx, vy, vz, &
-                           force(1)%ccomp, force(2)%ccomp, force(3)%ccomp, &
-                           t, dt, 0, 0, this%pde%todir_)
-
-          CALL this%pde%workspace_%free_complex_tmp(vz)
-          CALL this%pde%workspace_%free_complex_tmp(vy)
-          CALL this%pde%workspace_%free_complex_tmp(vx)
-
-      END SUBROUTINE gnudgedsim_global
-
-!=================================================================
-! SUBROUTINE: gnudgedsim_spectra
-!
-! Type-bound spectral diagnostic for a nudged ensemble member.
-! Delegates to pde%spectra for the ensemble field (full output
-! including energy transfer), then computes the difference
-! spectrum (ensemble - reference) and writes it to
-! 'dspectrum.XXX.txt' in the member's todir_.
-!
-! Parameters:
-!   this      : nudged simulation member
-!   ref_field : reference simulation's current field (field_nxt)
-!=================================================================
-      SUBROUTINE gnudgedsim_spectra(this, ref_field)
-
-          USE fprecision
-
-          IMPLICIT NONE
-
-          CLASS(GNudgedSim), INTENT(IN) :: this
-          TYPE (GStateComp), INTENT(IN) :: ref_field(:)
-
-          COMPLEX(KIND=GP), POINTER :: vx(:,:,:), vy(:,:,:), vz(:,:,:)
-          LOGICAL :: bret
-
-          CALL this%pde%spectra(this%field_nxt)
-
-          CALL this%pde%workspace_%get_complex_tmp(vx, bret)
-          CALL this%pde%workspace_%get_complex_tmp(vy, bret)
-          CALL this%pde%workspace_%get_complex_tmp(vz, bret)
-
-          vx = this%field_nxt(1)%ccomp - ref_field(1)%ccomp
-          vy = this%field_nxt(2)%ccomp - ref_field(2)%ccomp
-          vz = this%field_nxt(3)%ccomp - ref_field(3)%ccomp
-
-          CALL spectrum_ndg(vx, vy, vz, this%pde%todir_, ext)
-
-          CALL this%pde%workspace_%free_complex_tmp(vz)
-          CALL this%pde%workspace_%free_complex_tmp(vy)
-          CALL this%pde%workspace_%free_complex_tmp(vx)
-
-      END SUBROUTINE gnudgedsim_spectra
-
-!=================================================================
-! SUBROUTINE: spectrum_ndg
-!
-! Computes the kinetic energy spectrum and writes it to
-! 'dspectrum.XXX.txt'. Same normalization as spectrum():
-! E = sum[E(k).Dkk].
-!
-! Parameters:
-!   a,b,c : velocity field components (spectral)
-!   path  : output directory
-!   nmb   : file extension (e.g. '001')
-!=================================================================
-      SUBROUTINE spectrum_ndg(a, b, c, path, nmb)
-
-          USE fprecision
-          USE grid
-          USE mpivars
-          USE boxsize
-          USE pseudospec_hd
-
-          IMPLICIT NONE
-
-          COMPLEX(KIND=GP), INTENT(IN), DIMENSION(nz,ny,ista:iend) :: a,b,c
-          CHARACTER(LEN=*), INTENT(IN) :: path, nmb
-
-          DOUBLE PRECISION, DIMENSION(nmax/2+1) :: Ek, Hk
-          INTEGER :: i
-
-          CALL spectrumc(a, b, c, 1, 0, Ek, Hk)
-
-          IF (myrank.eq.0) THEN
-             OPEN(1,file=TRIM(path)//'/dspectrum.'//nmb//'.txt')
-             DO i = 1, nmax/2+1
-                WRITE(1,FMT='(E13.6,E23.15)') Dkk*i, 0.5_GP*Ek(i)/Dkk
-             END DO
-             CLOSE(1)
-          ENDIF
-
-      END SUBROUTINE spectrum_ndg
-
-!=================================================================
-! SUBROUTINE: hdcheck_ndg
-!
-! Computes and writes global quantities (energy, enstrophy,
-! injection rate) for a velocity field given as raw spectral
-! arrays, writing to 'difference.txt' in the specified directory.
-!
-! Output files (written to todir):
-!   'difference.txt'  : time, <v^2>, <omega^2>, injection
-!   'helicity.txt'    : time, kinetic helicity     [if hel=1]
-!   'divergence.txt'  : time, <(div.v)^2>          [if chk=1]
-!
-! Parameters:
-!   vx,vy,vz : velocity field components (spectral)
-!   fx,fy,fz : forcing field components  (spectral)
-!   t        : timestep index
-!   dt       : time step
-!   hel      : =0 skips helicity; =1 computes kinetic helicity
-!   chk      : =0 skips divergence check; =1 performs it
-!   todir    : output directory
-!=================================================================
-      SUBROUTINE hdcheck_ndg(vx, vy, vz, fx, fy, fz, t, dt, hel, chk, todir)
-
-          USE fprecision
-          USE commtypes
-          USE grid
-          USE mpivars
-          USE pseudospec_fluid
-!$        USE threads
-
-          IMPLICIT NONE
-
-          COMPLEX(KIND=GP), DIMENSION(nz,ny,ista:iend), INTENT(INOUT) :: vx,vy,vz
-          COMPLEX(KIND=GP), DIMENSION(nz,ny,ista:iend), INTENT(INOUT) :: fx,fy,fz
-          REAL(KIND=GP),    INTENT(IN) :: dt
-          INTEGER,          INTENT(IN) :: t, hel, chk
-          CHARACTER(LEN=*), INTENT(IN) :: todir
-
-          COMPLEX(KIND=GP), DIMENSION(nz,ny,ista:iend) :: c1,c2,c3
-          DOUBLE PRECISION :: eng,ens,pot,khe
-          DOUBLE PRECISION :: div,tmp
-          REAL(KIND=GP)    :: tmq
-          INTEGER          :: i,j,k
-
-          div = 0.0D0
-          tmp = 0.0D0
-          tmq = 1.0_GP/ &
-                (real(nx,kind=GP)*real(ny,kind=GP)*real(nz,kind=GP))**2
-
-          IF (chk.eq.1) THEN
-             CALL derivk3(vx,c1,1)
-             CALL derivk3(vy,c2,2)
-             CALL derivk3(vz,c3,3)
-             IF (ista.eq.1) THEN
-!$omp parallel do private (k) reduction(+:tmp)
-                DO j = 1,ny
-                   DO k = 1,nz
-                      tmp = tmp+abs(c1(k,j,1)+c2(k,j,1)+c3(k,j,1))**2*tmq
-                   END DO
-                END DO
-!$omp parallel do if (iend-2.ge.nth) private (j,k) reduction(+:tmp)
-                DO i = 2,iend
-!$omp parallel do if (iend-2.lt.nth) private (k) reduction(+:tmp)
-                   DO j = 1,ny
-                      DO k = 1,nz
-                         tmp = tmp+2*abs(c1(k,j,i)+c2(k,j,i)+c3(k,j,i))**2*tmq
-                      END DO
-                   END DO
-                END DO
-             ELSE
-!$omp parallel do if (iend-ista.ge.nth) private (j,k) reduction(+:tmp)
-                DO i = ista,iend
-!$omp parallel do if (iend-ista.lt.nth) private (k) reduction(+:tmp)
-                   DO j = 1,ny
-                      DO k = 1,nz
-                         tmp = tmp+2*abs(c1(k,j,i)+c2(k,j,i)+c3(k,j,i))**2*tmq
-                      END DO
-                   END DO
-                END DO
-             ENDIF
-             CALL MPI_REDUCE(tmp,div,1,MPI_DOUBLE_PRECISION,MPI_SUM,0, &
-                             MPI_COMM_WORLD,ierr)
-          ENDIF
-
-          CALL energy(vx,vy,vz,eng,1)
-          CALL energy(vx,vy,vz,ens,0)
-          IF (hel.eq.1) THEN
-             CALL helicity(vx,vy,vz,khe)
-          ENDIF
-          CALL cross(vx,vy,vz,fx,fy,fz,pot,1)
-
-          IF (myrank.eq.0) THEN
-             OPEN(1,file=TRIM(todir)//'/difference.txt',position='append')
-             WRITE(1,10) (t-1)*dt,eng,ens,pot
-   10        FORMAT( E13.6,E26.18,E26.18,E26.18 )
-             CLOSE(1)
-             IF (hel.eq.1) THEN
-                OPEN(1,file=TRIM(todir)//'/helicity.txt',position='append')
-                WRITE(1,FMT='(E13.6,E26.18)') (t-1)*dt,khe
-                CLOSE(1)
-             ENDIF
-             IF (chk.eq.1) THEN
-                OPEN(1,file=TRIM(todir)//'/divergence.txt',position='append')
-                WRITE(1,FMT='(E13.6,E26.18)') (t-1)*dt,div
-                CLOSE(1)
-             ENDIF
-          ENDIF
-
-      END SUBROUTINE hdcheck_ndg
-
-!=================================================================
-! SUBROUTINE: replace_scales
-!
-! Replaces the spectral modes of 'dst' with those of 'src' for
-! all wavenumber shells k <= kcut. Modes at shells k > kcut in
-! 'dst' are left unchanged. Both states must have the same number
-! of components and be defined on the same distributed grid.
-!
-! Parameters:
-!   src  : source field state (reference simulation)
-!   dst  : destination field state (nudged simulation member)
-!   kcut : cutoff wavenumber shell (integer)
-!=================================================================
-      SUBROUTINE replace_scales(src, dst, kcut)
-
-          USE fprecision
-          USE mpivars
-          USE grid
-          USE kes
-          USE boxsize
-          USE gstate_mod
-
-          TYPE(GStateComp), INTENT(IN)    :: src(:)
-          TYPE(GStateComp), INTENT(INOUT) :: dst(:)
-          INTEGER,          INTENT(IN)    :: kcut
-
-          INTEGER :: ic, i, j, k
-
-          DO ic = 1, SIZE(src)
-              DO i = ista, iend
-                  DO j = 1, ny
-                      DO k = 1, nz
-                          IF (int(sqrt(kk2(k,j,i))/Dkk+0.5_GP) .le. kcut) THEN
-                              dst(ic)%ccomp(k,j,i) = src(ic)%ccomp(k,j,i)
-                          ENDIF
-                      END DO
-                  END DO
-              END DO
-          END DO
-
-      END SUBROUTINE replace_scales
 
       END PROGRAM MAIN
