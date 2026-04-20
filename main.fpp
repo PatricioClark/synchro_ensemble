@@ -64,9 +64,10 @@
          CLASS(GStepperBase), ALLOCATABLE :: stepper
          CLASS(icChain),      ALLOCATABLE :: iclist(:)
          INTEGER                          :: num_components
+      CONTAINS
+         PROCEDURE :: global => gnudgedsim_global
       END TYPE GNudgedSim
 
-      TYPE(GStateComp), ALLOCATABLE :: diff(:)
       TYPE(GNudgedSim), ALLOCATABLE :: ensemble(:)
 ! Synchro ------------------------------------------
 
@@ -265,6 +266,9 @@ RK :  DO t = ini,step
          IF ((timec.eq.cstep).and.(bench.eq.0)) THEN
             timec = 0
 	         CALL fluid%global(field_nxt, force, t)
+            DO ir = 1, SIZE(ensemble)
+               CALL ensemble(ir)%global(field_nxt, force, t)
+            END DO
          ENDIF
 
 ! Every 'sstep' steps writes spectra
@@ -318,6 +322,165 @@ RK :  DO t = ini,step
       CALL fftp3d_destroy_plan(planrc)
 
       CONTAINS
+
+!=================================================================
+! SUBROUTINE: gnudgedsim_global
+!
+! Type-bound global diagnostic for a nudged ensemble member.
+! Delegates to pde%global for the ensemble field (which writes
+! to the member's own todir_), then computes the difference
+! field (ensemble - reference) using workspace temporaries and
+! writes its global quantities to 'difference.txt' in the same
+! directory via hdcheck_ndg.
+!
+! Parameters:
+!   this      : nudged simulation member
+!   ref_field : reference simulation's current field (field_nxt)
+!   force     : forcing field
+!   t         : timestep index
+!=================================================================
+      SUBROUTINE gnudgedsim_global(this, ref_field, force, t)
+
+          USE fprecision
+
+          IMPLICIT NONE
+
+          CLASS(GNudgedSim), INTENT(IN) :: this
+          TYPE (GStateComp), INTENT(IN) :: ref_field(:), force(:)
+          INTEGER,           INTENT(IN) :: t
+
+          COMPLEX(KIND=GP), POINTER :: vx(:,:,:), vy(:,:,:), vz(:,:,:)
+          LOGICAL :: bret
+
+          CALL this%pde%global(this%field_nxt, force, t)
+
+          CALL this%pde%workspace_%get_complex_tmp(vx, bret)
+          CALL this%pde%workspace_%get_complex_tmp(vy, bret)
+          CALL this%pde%workspace_%get_complex_tmp(vz, bret)
+
+          vx = this%field_nxt(1)%ccomp - ref_field(1)%ccomp
+          vy = this%field_nxt(2)%ccomp - ref_field(2)%ccomp
+          vz = this%field_nxt(3)%ccomp - ref_field(3)%ccomp
+
+          CALL hdcheck_ndg(vx, vy, vz, &
+                           force(1)%ccomp, force(2)%ccomp, force(3)%ccomp, &
+                           t, dt, 0, 0, this%pde%todir_)
+
+          CALL this%pde%workspace_%free_complex_tmp(vz)
+          CALL this%pde%workspace_%free_complex_tmp(vy)
+          CALL this%pde%workspace_%free_complex_tmp(vx)
+
+      END SUBROUTINE gnudgedsim_global
+
+!=================================================================
+! SUBROUTINE: hdcheck_ndg
+!
+! Computes and writes global quantities (energy, enstrophy,
+! injection rate) for a velocity field given as raw spectral
+! arrays, writing to 'difference.txt' in the specified directory.
+!
+! Output files (written to todir):
+!   'difference.txt'  : time, <v^2>, <omega^2>, injection
+!   'helicity.txt'    : time, kinetic helicity     [if hel=1]
+!   'divergence.txt'  : time, <(div.v)^2>          [if chk=1]
+!
+! Parameters:
+!   vx,vy,vz : velocity field components (spectral)
+!   fx,fy,fz : forcing field components  (spectral)
+!   t        : timestep index
+!   dt       : time step
+!   hel      : =0 skips helicity; =1 computes kinetic helicity
+!   chk      : =0 skips divergence check; =1 performs it
+!   todir    : output directory
+!=================================================================
+      SUBROUTINE hdcheck_ndg(vx, vy, vz, fx, fy, fz, t, dt, hel, chk, todir)
+
+          USE fprecision
+          USE commtypes
+          USE grid
+          USE mpivars
+          USE pseudospec_fluid
+!$        USE threads
+
+          IMPLICIT NONE
+
+          COMPLEX(KIND=GP), DIMENSION(nz,ny,ista:iend), INTENT(INOUT) :: vx,vy,vz
+          COMPLEX(KIND=GP), DIMENSION(nz,ny,ista:iend), INTENT(INOUT) :: fx,fy,fz
+          REAL(KIND=GP),    INTENT(IN) :: dt
+          INTEGER,          INTENT(IN) :: t, hel, chk
+          CHARACTER(LEN=*), INTENT(IN) :: todir
+
+          COMPLEX(KIND=GP), DIMENSION(nz,ny,ista:iend) :: c1,c2,c3
+          DOUBLE PRECISION :: eng,ens,pot,khe
+          DOUBLE PRECISION :: div,tmp
+          REAL(KIND=GP)    :: tmq
+          INTEGER          :: i,j,k
+
+          div = 0.0D0
+          tmp = 0.0D0
+          tmq = 1.0_GP/ &
+                (real(nx,kind=GP)*real(ny,kind=GP)*real(nz,kind=GP))**2
+
+          IF (chk.eq.1) THEN
+             CALL derivk3(vx,c1,1)
+             CALL derivk3(vy,c2,2)
+             CALL derivk3(vz,c3,3)
+             IF (ista.eq.1) THEN
+!$omp parallel do private (k) reduction(+:tmp)
+                DO j = 1,ny
+                   DO k = 1,nz
+                      tmp = tmp+abs(c1(k,j,1)+c2(k,j,1)+c3(k,j,1))**2*tmq
+                   END DO
+                END DO
+!$omp parallel do if (iend-2.ge.nth) private (j,k) reduction(+:tmp)
+                DO i = 2,iend
+!$omp parallel do if (iend-2.lt.nth) private (k) reduction(+:tmp)
+                   DO j = 1,ny
+                      DO k = 1,nz
+                         tmp = tmp+2*abs(c1(k,j,i)+c2(k,j,i)+c3(k,j,i))**2*tmq
+                      END DO
+                   END DO
+                END DO
+             ELSE
+!$omp parallel do if (iend-ista.ge.nth) private (j,k) reduction(+:tmp)
+                DO i = ista,iend
+!$omp parallel do if (iend-ista.lt.nth) private (k) reduction(+:tmp)
+                   DO j = 1,ny
+                      DO k = 1,nz
+                         tmp = tmp+2*abs(c1(k,j,i)+c2(k,j,i)+c3(k,j,i))**2*tmq
+                      END DO
+                   END DO
+                END DO
+             ENDIF
+             CALL MPI_REDUCE(tmp,div,1,MPI_DOUBLE_PRECISION,MPI_SUM,0, &
+                             MPI_COMM_WORLD,ierr)
+          ENDIF
+
+          CALL energy(vx,vy,vz,eng,1)
+          CALL energy(vx,vy,vz,ens,0)
+          IF (hel.eq.1) THEN
+             CALL helicity(vx,vy,vz,khe)
+          ENDIF
+          CALL cross(vx,vy,vz,fx,fy,fz,pot,1)
+
+          IF (myrank.eq.0) THEN
+             OPEN(1,file=TRIM(todir)//'/difference.txt',position='append')
+             WRITE(1,10) (t-1)*dt,eng,ens,pot
+   10        FORMAT( E13.6,E26.18,E26.18,E26.18 )
+             CLOSE(1)
+             IF (hel.eq.1) THEN
+                OPEN(1,file=TRIM(todir)//'/helicity.txt',position='append')
+                WRITE(1,FMT='(E13.6,E26.18)') (t-1)*dt,khe
+                CLOSE(1)
+             ENDIF
+             IF (chk.eq.1) THEN
+                OPEN(1,file=TRIM(todir)//'/divergence.txt',position='append')
+                WRITE(1,FMT='(E13.6,E26.18)') (t-1)*dt,div
+                CLOSE(1)
+             ENDIF
+          ENDIF
+
+      END SUBROUTINE hdcheck_ndg
 
 !=================================================================
 ! SUBROUTINE: replace_scales
