@@ -59,11 +59,11 @@
 ! Synchro ------------------------------------------
 ! Type encapsulating all state for a single nudged simulation member
       TYPE :: GNudgedSim
-          TYPE(GStateComp),    ALLOCATABLE :: field(:),field_nxt(:)
-          CLASS(EquationBase), ALLOCATABLE :: pde
-          CLASS(GStepperBase), ALLOCATABLE :: stepper
-          CLASS(icChain),      ALLOCATABLE :: iclist(:)
-          INTEGER                          :: num_components
+         TYPE(GStateComp),    ALLOCATABLE :: field(:),field_nxt(:)
+         CLASS(EquationBase), ALLOCATABLE :: pde
+         CLASS(GStepperBase), ALLOCATABLE :: stepper
+         CLASS(icChain),      ALLOCATABLE :: iclist(:)
+         INTEGER                          :: num_components
       END TYPE GNudgedSim
 
       TYPE(GStateComp), ALLOCATABLE :: diff(:)
@@ -134,39 +134,33 @@
       forcemethod  = init_forcing_from_file('parameter.inp',workspace)
 
 ! Synchro ------------------------------------------
-     ALLOCATE(ensemble(num_realizations))
-     DO ir = 1, SIZE(ensemble)
-       ! BLOCK and MOVE_ALLOC are needed becauce the base class
-       ! does not initilize the pointers to null ("=> null()" in declaration)
-       ! This is a workaround
-       ! Maybe I can delete them now
-       WRITE(outlabel,'(I3.3)') ir
-       BLOCK
-         CLASS(EquationBase), ALLOCATABLE :: tmp_pde
-         tmp_pde = init_pdes_from_file('parameter'//TRIM(outlabel)//'.inp')
-         CALL MOVE_ALLOC(tmp_pde, ensemble(ir)%pde)
-       END BLOCK
-       CALL ensemble(ir)%pde%Solver_ctor('parameter'//TRIM(outlabel)//'.inp', &
-                                         workspace, planio)
-       ensemble(ir)%num_components = ensemble(ir)%pde%state_size()
-       CALL GState_alloc(ensemble(ir)%field    , ensemble(ir)%num_components)
-       CALL GState_alloc(ensemble(ir)%field_nxt, ensemble(ir)%num_components)
-       BLOCK
-         CLASS(icChain),    ALLOCATABLE :: tmp_ic(:)
-         tmp_ic  = init_ic_from_file('parameter'//TRIM(outlabel)//'.inp')
-         CALL MOVE_ALLOC(tmp_ic,  ensemble(ir)%iclist)
-       END BLOCK
-     END DO
+      ALLOCATE(ensemble(num_realizations))
+      DO ir = 1, SIZE(ensemble)
+         ! BLOCK and MOVE_ALLOC are needed becauce the base class
+         ! does not initilize the pointers to null ("=> null()" in declaration)
+         ! This is a workaround
+         ! Maybe I can delete them now
+         WRITE(outlabel,'(I3.3)') ir
+         BLOCK
+            CLASS(EquationBase), ALLOCATABLE :: tmp_pde
+            tmp_pde = init_pdes_from_file('parameter'//TRIM(outlabel)//'.inp')
+            CALL MOVE_ALLOC(tmp_pde, ensemble(ir)%pde)
+         END BLOCK
+         CALL ensemble(ir)%pde%Solver_ctor('parameter'//TRIM(outlabel)//'.inp', &
+                                           workspace, planio)
+         ensemble(ir)%num_components = ensemble(ir)%pde%state_size()
+         CALL GState_alloc(ensemble(ir)%field    , ensemble(ir)%num_components)
+         CALL GState_alloc(ensemble(ir)%field_nxt, ensemble(ir)%num_components)
+         BLOCK
+            CLASS(icChain),    ALLOCATABLE :: tmp_ic(:)
+            tmp_ic  = init_ic_from_file('parameter'//TRIM(outlabel)//'.inp')
+            CALL MOVE_ALLOC(tmp_ic,  ensemble(ir)%iclist)
+         END BLOCK
+      END DO
 ! Synchro ------------------------------------------
 
 ! Initialization of the numerical domain
       CALL box_init('parameter.inp')
-
-! Initialization of the particles
-      if (dopart) then
-         CALL particle%part_ctor('parameter.inp',fluid,workspace,part,part_nxt)
-         icplist = init_icp_from_file('parameter.inp')
-      endif
 
 ! Initializes the FFT library. This must be done at this
 ! stage as it requires status and benchmark initialization.
@@ -225,64 +219,52 @@
 
 ! Synchro ------------------------------------------
 ! Initialize states and stepper
-     DO ir = 1, SIZE(ensemble)
-       WRITE(outlabel,'(I3.3)') ir
-       CALL init_allstates(ensemble(ir)%iclist, ensemble(ir)%pde, ensemble(ir)%field)
-       BLOCK
+      DO ir = 1, SIZE(ensemble)
+      WRITE(outlabel,'(I3.3)') ir
+      CALL init_allstates(ensemble(ir)%iclist, ensemble(ir)%pde, ensemble(ir)%field)
+      BLOCK
          CLASS(GStepperBase), ALLOCATABLE :: tmp_stp
          tmp_stp = build_stepper_from_file('parameter'//TRIM(outlabel)//'.inp', &
                                            workspace, &
                                            ensemble(ir)%pde)
          CALL MOVE_ALLOC(tmp_stp, ensemble(ir)%stepper)
-       END BLOCK
-     END DO
+      END BLOCK
+      END DO
 
 ! Initial replace scales
-     DO ir = 1, SIZE(ensemble)
-        CALL replace_scales(field, ensemble(ir)%field, kndg)
-     END DO
+      DO ir = 1, SIZE(ensemble)
+         CALL replace_scales(field, ensemble(ir)%field, kndg)
+         ensemble(ir)%field_nxt = ensemble(ir)%field
+      END DO
 ! Synchro ------------------------------------------
 
 ! Sets up the time stepper
-      if (dopart) then
-        stepper = build_stepper_from_file('parameter.inp',workspace,fluid,particle)
-      else
-        stepper = build_stepper_from_file('parameter.inp',workspace,fluid)
-      endif
+      stepper = build_stepper_from_file('parameter.inp',workspace,fluid)
 
 ! Time integration scheme starts here.
 ! If we are doing a benchmark, we measure cputime before
 ! starting. We also re-inititialize the fftp timers.
       IF (bench.eq.1) THEN
-         ffttime  = 0.D00; tratime  = 0.0D0; comtime  = 0.D00; tottime  = 0.0D0
-         CALL GTStart(ihcpu1); CALL GTStart(ihomp1); CALL GTStart(ihwtm1)
+          ffttime  = 0.D00; tratime  = 0.0D0; comtime  = 0.D00; tottime  = 0.0D0
+          CALL GTStart(ihcpu1); CALL GTStart(ihomp1); CALL GTStart(ihwtm1)
       ENDIF
 
- RK : DO t = ini,step
+RK :  DO t = ini,step
          time = (t-1)*dt
 ! Every 'tstep' steps, stores the fields in binary files
          IF ((timet.eq.tstep).and.(bench.eq.0)) THEN
             timet = 0
             tind = tind+1
-	    CALL fluid%write_states(field_nxt, planio)
-        DO ir = 1, SIZE(ensemble)
-           CALL ensemble(ir)%pde%write_states(ensemble(ir)%field, planio)
-        END DO
-	 ENDIF
-
-! Every 'pstep' steps, stores the particle states
-         if (dopart) then
-            IF ((timep.eq.pstep).and.(bench.eq.0)) THEN
-               timep = 0
-	       pind = pind+1
-  	       CALL particle%write_pstate(time,fluid,field_nxt,part_nxt)
-	    ENDIF
-	 endif
+            CALL fluid%write_states(field_nxt, planio)
+            DO ir = 1, SIZE(ensemble)
+               CALL ensemble(ir)%pde%write_states(ensemble(ir)%field_nxt, planio)
+            END DO
+         ENDIF
 
 ! Every 'cstep' steps writes global quantities
          IF ((timec.eq.cstep).and.(bench.eq.0)) THEN
             timec = 0
-	    CALL fluid%global(field_nxt, force, t)
+	         CALL fluid%global(field_nxt, force, t)
          ENDIF
 
 ! Every 'sstep' steps writes spectra
@@ -294,14 +276,17 @@
 
 ! Time evolution
          CALL update_forcing(forcemethod,fluid,force)
-         if (dopart) then
-            field = field_nxt
-	    part  = part_nxt
-            CALL stepper%gstep(time, field, part, force, dt, field_nxt, part_nxt)
-	 else
-	    field = field_nxt
-            CALL stepper%gstep(time, field, force, dt, field_nxt)
-	 endif
+	      field = field_nxt
+         CALL stepper%gstep(time, field, force, dt, field_nxt)
+! Synchro ----------------------------------------------------------
+! step ensemble members and replace large scales
+         DO ir = 1, SIZE(ensemble)
+            ensemble(ir)%field = ensemble(ir)%field_nxt
+            CALL ensemble(ir)%stepper%gstep(time, ensemble(ir)%field, &
+                                            force, dt, ensemble(ir)%field_nxt)
+            CALL replace_scales(field_nxt, ensemble(ir)%field_nxt, kndg)
+         END DO
+! Synchro ----------------------------------------------------------
          timet = timet+1; timep = timep+1; timec = timec+1; times = times+1
       END DO RK
 
@@ -331,5 +316,49 @@
       CALL MPI_FINALIZE(ierr)
       CALL fftp3d_destroy_plan(plancr)
       CALL fftp3d_destroy_plan(planrc)
-      
+
+      CONTAINS
+
+!=================================================================
+! SUBROUTINE: replace_scales
+!
+! Replaces the spectral modes of 'dst' with those of 'src' for
+! all wavenumber shells k <= kcut. Modes at shells k > kcut in
+! 'dst' are left unchanged. Both states must have the same number
+! of components and be defined on the same distributed grid.
+!
+! Parameters:
+!   src  : source field state (reference simulation)
+!   dst  : destination field state (nudged simulation member)
+!   kcut : cutoff wavenumber shell (integer)
+!=================================================================
+      SUBROUTINE replace_scales(src, dst, kcut)
+
+          USE fprecision
+          USE mpivars
+          USE grid
+          USE kes
+          USE boxsize
+          USE gstate_mod
+
+          TYPE(GStateComp), INTENT(IN)    :: src(:)
+          TYPE(GStateComp), INTENT(INOUT) :: dst(:)
+          INTEGER,          INTENT(IN)    :: kcut
+
+          INTEGER :: ic, i, j, k
+
+          DO ic = 1, SIZE(src)
+              DO i = ista, iend
+                  DO j = 1, ny
+                      DO k = 1, nz
+                          IF (int(sqrt(kk2(k,j,i))/Dkk+0.5_GP) .le. kcut) THEN
+                              dst(ic)%ccomp(k,j,i) = src(ic)%ccomp(k,j,i)
+                          ENDIF
+                      END DO
+                  END DO
+              END DO
+          END DO
+
+      END SUBROUTINE replace_scales
+
       END PROGRAM MAIN
