@@ -544,6 +544,7 @@
 
 ! Synchro ------------------------------------------
       INTEGER :: num_realizations, kndg
+      INTEGER :: ensemble_seed_base
       INTEGER :: ir
       CHARACTER(LEN=8)   :: outlabel
       REAL(KIND=GP) :: nudge_lambda
@@ -575,6 +576,7 @@
 ! Synchro ------------------------------------------
       num_realizations = 1
       kndg      = 1
+      ensemble_seed_base = 50000
       ! Fixed, externally chosen relaxation rate -- pick this from
       ! the large-scale eddy turnover time at kndg (e.g.
       ! lambda ~ sqrt(kndg^3 * E(kndg)) estimated offline from the
@@ -588,6 +590,8 @@
       CALL MPI_BCAST(num_realizations,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
       CALL MPI_BCAST(kndg     ,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
       CALL MPI_BCAST(nudge_lambda,1,GC_REAL,0,MPI_COMM_WORLD,ierr)
+      CALL MPI_BCAST(ensemble_seed_base,1,MPI_INTEGER,0, &
+                     MPI_COMM_WORLD,ierr)
 ! Synchro ------------------------------------------
 
 ! I/O initialization
@@ -701,7 +705,9 @@
          ! reference field, then decorrelate its un-nudged scales
          ! (k>kndg) by scrambling their phases. k<=kndg stays an
          ! exact copy of the reference, same as replace_scales
-         ! would have produced.
+         ! would have produced. Use a different deterministic seed
+         ! for each ensemble member's phase scrambling.
+         seed = ensemble_seed_base + 10007*ir
          ensemble(ir)%field = field
          CALL scramble_phases_above(ensemble(ir)%field, kndg)
       ELSE
