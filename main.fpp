@@ -353,6 +353,7 @@
 
 ! Synchro ------------------------------------------
       INTEGER :: num_realizations, kndg
+      INTEGER :: ensemble_seed_base
       INTEGER :: ir
       CHARACTER(LEN=8)   :: outlabel
       NAMELIST / ensembleparams / num_realizations, kndg
@@ -382,14 +383,25 @@
 
 ! Synchro ------------------------------------------
       num_realizations = 1
-      kndg      = 1
+      kndg = 1
+      ensemble_seed_base = 50000
+
       IF (myrank.eq.0) THEN
-         OPEN(1,file='parameter.inp',status='unknown',form='formatted')
-         READ(1,NML=ensembleparams)
-         CLOSE(1)
+        OPEN(1,file='parameter.inp',status='unknown',form='formatted')
+        READ(1,NML=ensembleparams)
+        CLOSE(1)
       ENDIF
-      CALL MPI_BCAST(num_realizations,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
-      CALL MPI_BCAST(kndg     ,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+
+      CALL MPI_BCAST(num_realizations,1,MPI_INTEGER,0, &
+                     MPI_COMM_WORLD,ierr)
+
+      CALL MPI_BCAST(kndg,1,MPI_INTEGER,0, &
+                     MPI_COMM_WORLD,ierr)
+
+      CALL MPI_BCAST(ensemble_seed_base,1,MPI_INTEGER,0, &
+                     MPI_COMM_WORLD,ierr)
+
+
 ! Synchro ------------------------------------------
 
 ! I/O initialization
@@ -495,9 +507,21 @@
 
 ! Synchro ------------------------------------------
 ! Initialize states and stepper
-      DO ir = 1, SIZE(ensemble)
-      WRITE(outlabel,'(I3.3)') ir
-      CALL init_allstates(ensemble(ir)%iclist, ensemble(ir)%pde, ensemble(ir)%field)
+
+     DO ir = 1, SIZE(ensemble)
+
+     WRITE(outlabel,'(I3.3)') ir
+
+     ! The reference and the common forcing have already been initialized.
+     ! Use a different deterministic seed for each ensemble member.
+     IF (stat.eq.0) THEN
+       seed = ensemble_seed_base + 10007*ir
+     ENDIF
+
+     CALL init_allstates(ensemble(ir)%iclist, &
+                           ensemble(ir)%pde, &
+                           ensemble(ir)%field)
+
       BLOCK
          CLASS(GStepperBase), ALLOCATABLE :: tmp_stp
          tmp_stp = build_stepper_from_file('parameter'//TRIM(outlabel)//'.inp', &
